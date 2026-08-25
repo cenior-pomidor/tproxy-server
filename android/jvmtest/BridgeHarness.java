@@ -37,15 +37,17 @@ public class BridgeHarness {
     private static String relayBase;
     private static String publicHost;
     private static int failures;
+    private static volatile FakeBridge current;
 
     public static void main(String[] args) throws Exception {
         relayBase = args[0];
         publicHost = args[1];
         String secret = args[2];
 
-        FakeBridge bridge = new FakeBridge();
         WebView.loadHook = url -> {
             if (url.startsWith("https://") && url.contains("?bridge=")) {
+                FakeBridge bridge = new FakeBridge();
+                current = bridge;
                 new Thread(() -> bridge.load(url), "fake-bridge").start();
             }
         };
@@ -69,6 +71,27 @@ public class BridgeHarness {
         concurrent(port, 4, 512 * 1024);
         backendClose(port);
         echoOnce(port, 4096, "stream after a backend close");
+
+        // A carrier failure closes every logical stream and the transport rebuilds the WebView.
+        Socket doomed = new Socket("127.0.0.1", port);
+        doomed.setSoTimeout(15000);
+        doomed.getOutputStream().write("still here".getBytes(StandardCharsets.US_ASCII));
+        doomed.getOutputStream().flush();
+        new DataInputStream(doomed.getInputStream()).readFully(new byte[10]);
+        current.fail();
+        deadline = System.currentTimeMillis() + 10000;
+        while (transport.getState() == WebProxyTransport.STATE_CONNECTED && System.currentTimeMillis() < deadline) {
+            Thread.sleep(20);
+        }
+        check(transport.getState() != WebProxyTransport.STATE_CONNECTED, "reported carrier failure drops the session");
+        check(doomed.getInputStream().read() == -1, "carrier failure closes the live streams");
+        doomed.close();
+        deadline = System.currentTimeMillis() + 30000;
+        while (transport.getState() != WebProxyTransport.STATE_CONNECTED && System.currentTimeMillis() < deadline) {
+            Thread.sleep(50);
+        }
+        check(transport.getState() == WebProxyTransport.STATE_CONNECTED, "carrier reconnects on its own");
+        echoOnce(port, 8192, "round trip after the reconnect");
 
         check(transport.getState() == WebProxyTransport.STATE_CONNECTED, "carrier still connected at the end");
         transport.stop();
@@ -164,6 +187,8 @@ public class BridgeHarness {
     private static final class FakeBridge {
 
         private final LinkedBlockingQueue<byte[]> uplink = new LinkedBlockingQueue<>();
+        private WebViewCompat.WebMessageListener listener;
+        private WebView view;
         private String bootstrap;
         private String sessionToken;
         private volatile String downCursor = "0";
@@ -171,6 +196,8 @@ public class BridgeHarness {
         private JavaScriptReplyProxy proxy;
 
         private void load(String url) {
+            listener = WebViewCompat.installedListener;
+            view = WebViewCompat.installedView;
             try {
                 String capability = url.substring(url.indexOf("?bridge=") + "?bridge=".length(), url.indexOf('#'));
                 String nonce = url.substring(url.indexOf("#android=") + "#android=".length());
@@ -233,7 +260,7 @@ public class BridgeHarness {
         private void uplinkLoop() {
             int sequence = 1;
             try {
-                while (true) {
+                while (current == this) {
                     byte[] batch = uplink.take();
                     HttpURLConnection connection = open("POST", "/api/v1/up", sessionToken);
                     connection.setDoOutput(true);
@@ -255,7 +282,7 @@ public class BridgeHarness {
 
         private void downlinkLoop() {
             try {
-                while (true) {
+                while (current == this) {
                     HttpURLConnection connection = open("POST", "/api/v1/down", sessionToken);
                     connection.setRequestProperty("X-Down-Cursor", downCursor);
                     int code = connection.getResponseCode();
@@ -279,10 +306,13 @@ public class BridgeHarness {
             }
         }
 
+        /** Reports the carrier failure the real bridge sends when its session dies. */
+        private void fail() {
+            deliver(new WebMessageCompat("{\"t\":\"status\",\"state\":\"failed\"}"));
+        }
+
         private void deliver(WebMessageCompat message) {
-            WebViewCompat.WebMessageListener listener = WebViewCompat.installedListener;
-            WebView view = WebViewCompat.installedView;
-            if (listener == null || view == null) {
+            if (listener == null || view == null || (current != this && current != null)) {
                 return;
             }
             new android.os.Handler(android.os.Looper.getMainLooper()).post(() ->
