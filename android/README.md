@@ -44,6 +44,9 @@ Requirements: JDK 17, Android platform 35 and 36, build-tools 36.0.0,
 NDK 27.2.12479018, CMake 3.22.1, and roughly 25 GB of free disk space. The first
 build compiles the native tree for four ABIs and takes a while; later builds reuse it.
 
+The pinned tree builds to `org.telegram.messenger.beta` 12.10.1, minSdk 21,
+targetSdk 36, an APK of about 113 MB carrying all four `libtmessages.49.so` variants.
+
 ## Checks
 
 ```bash
