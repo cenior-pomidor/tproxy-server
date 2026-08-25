@@ -1,0 +1,2296 @@
+diff --git a/TMessagesProj/build.gradle b/TMessagesProj/build.gradle
+index 84b82260..7cf700e0 100644
+--- a/TMessagesProj/build.gradle
++++ b/TMessagesProj/build.gradle
+@@ -38,6 +38,8 @@ dependencies {
+     implementation "androidx.sharetarget:sharetarget:1.2.0"
+     implementation 'androidx.interpolator:interpolator:1.0.0'
+     implementation 'androidx.biometric:biometric:1.1.0'
++    // Exact origin binary WebMessage boundary for the WEB proxy carrier.
++    implementation 'androidx.webkit:webkit:1.14.0'
+ 
+     implementation 'com.google.android.gms:play-services-cast-framework:21.4.0'
+     implementation "androidx.mediarouter:mediarouter:1.7.0"
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/AndroidUtilities.java b/TMessagesProj/src/main/java/org/telegram/messenger/AndroidUtilities.java
+index 5a26f49b..ec95eea9 100644
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/AndroidUtilities.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/AndroidUtilities.java
+@@ -4597,6 +4597,13 @@ public class AndroidUtilities {
+             }
+             Uri data = intent.getData();
+             if (data != null) {
++                WebProxyLink webProxy = webProxyLink(data);
++                if (webProxy != null) {
++                    if (invoked) {
++                        showProxyAlert(activity, webProxy.hostname, "", "", "", webProxy.secret, SharedConfig.ProxyInfo.TYPE_WEB);
++                    }
++                    return true;
++                }
+                 String user = null;
+                 String password = null;
+                 String port = null;
+@@ -4684,7 +4691,44 @@ public class AndroidUtilities {
+         return true;
+     }
+ 
++    /**
++     * Recognises the dedicated WEB proxy link, https://t.me/webproxy?server=...&secret=... and its
++     * tg://webproxy form. A WEB proxy has no port, username or password.
++     */
++    private static WebProxyLink webProxyLink(Uri data) {
++        String url = data.toString();
++        String lower = url.toLowerCase();
++        int question = url.indexOf('?');
++        if (question < 0) {
++            return null;
++        }
++        if (!lower.startsWith("tg:webproxy?") && !lower.startsWith("tg://webproxy?")) {
++            String scheme = data.getScheme();
++            String host = data.getHost();
++            String path = data.getPath();
++            if (scheme == null || host == null || path == null) {
++                return null;
++            }
++            scheme = scheme.toLowerCase();
++            host = host.toLowerCase();
++            if (!scheme.equals("http") && !scheme.equals("https")) {
++                return null;
++            }
++            if (!host.equals("t.me") && !host.equals("telegram.me") && !host.equals("telegram.dog")) {
++                return null;
++            }
++            if (!path.toLowerCase().equals("/webproxy")) {
++                return null;
++            }
++        }
++        return WebProxyLink.fromQuery(url.substring(question + 1));
++    }
++
+     public static void showProxyAlert(Activity activity, final String address, final String port, final String user, final String password, final String secret) {
++        showProxyAlert(activity, address, port, user, password, secret, TextUtils.isEmpty(secret) ? SharedConfig.ProxyInfo.TYPE_SOCKS5 : SharedConfig.ProxyInfo.TYPE_MTPROTO);
++    }
++
++    public static void showProxyAlert(Activity activity, final String address, final String port, final String user, final String password, final String secret, final int type) {
+         final BottomSheet.Builder builder = new BottomSheet.Builder(activity);
+         builder.setApplyTopPadding(false);
+         builder.setApplyBottomPadding(false);
+@@ -4776,11 +4820,16 @@ public class AndroidUtilities {
+             SharedPreferences.Editor editor = MessagesController.getGlobalMainSettings().edit();
+             editor.putBoolean("proxy_enabled", true);
+             editor.putString("proxy_ip", address);
+-            int p = Utilities.parseInt(port);
++            int p = type == SharedConfig.ProxyInfo.TYPE_WEB ? WebProxyLink.PORT : Utilities.parseInt(port);
+             editor.putInt("proxy_port", p);
+ 
+             SharedConfig.ProxyInfo info;
+-            if (TextUtils.isEmpty(secret)) {
++            if (type == SharedConfig.ProxyInfo.TYPE_WEB) {
++                editor.remove("proxy_pass");
++                editor.remove("proxy_user");
++                editor.putString("proxy_secret", secret);
++                info = new SharedConfig.ProxyInfo(address, p, "", "", secret, SharedConfig.ProxyInfo.TYPE_WEB);
++            } else if (TextUtils.isEmpty(secret)) {
+                 editor.remove("proxy_secret");
+                 if (TextUtils.isEmpty(password)) {
+                     editor.remove("proxy_pass");
+@@ -4803,7 +4852,7 @@ public class AndroidUtilities {
+ 
+             SharedConfig.currentProxy = SharedConfig.addProxy(info);
+ 
+-            ConnectionsManager.setProxySettings(true, address, p, user, password, secret);
++            ConnectionsManager.setProxySettings(true, info.address, info.port, info.username, info.password, info.secret);
+             NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.proxySettingsChanged);
+             if (activity instanceof LaunchActivity) {
+                 INavigationLayout layout = ((LaunchActivity) activity).getActionBarLayout();
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/ProxyRotationController.java b/TMessagesProj/src/main/java/org/telegram/messenger/ProxyRotationController.java
+index 9b5fb771..6e9e13cb 100644
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/ProxyRotationController.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/ProxyRotationController.java
+@@ -66,7 +66,8 @@ public class ProxyRotationController implements NotificationCenter.NotificationC
+         List<SharedConfig.ProxyInfo> sortedList = new ArrayList<>(SharedConfig.proxyList);
+         Collections.sort(sortedList, (o1, o2) -> Long.compare(o1.ping, o2.ping));
+         for (SharedConfig.ProxyInfo info : sortedList) {
+-            if (info == SharedConfig.currentProxy || info.checking || !info.available) {
++            // WEB entries are never rotated into: one process wide WebView carrier serves the app.
++            if (info == SharedConfig.currentProxy || info.isWeb() || info.checking || !info.available) {
+                 continue;
+             }
+ 
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/SharedConfig.java b/TMessagesProj/src/main/java/org/telegram/messenger/SharedConfig.java
+index bbc3a939..4eee7e8c 100644
+--- a/TMessagesProj/src/main/java/org/telegram/messenger/SharedConfig.java
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/SharedConfig.java
+@@ -55,7 +55,8 @@ public class SharedConfig {
+      * V2: Ping and check time serialized
+      */
+     private final static int PROXY_SCHEMA_V2 = 2;
+-    private final static int PROXY_CURRENT_SCHEMA_VERSION = PROXY_SCHEMA_V2;
++    private final static int PROXY_SCHEMA_V3 = 3;
++    private final static int PROXY_CURRENT_SCHEMA_VERSION = PROXY_SCHEMA_V3;
+ 
+     public final static int PASSCODE_TYPE_PIN = 0,
+             PASSCODE_TYPE_PASSWORD = 1;
+@@ -372,11 +373,16 @@ public class SharedConfig {
+ 
+     public static class ProxyInfo {
+ 
++        public final static int TYPE_SOCKS5 = 0;
++        public final static int TYPE_MTPROTO = 1;
++        public final static int TYPE_WEB = 2;
++
+         public String address;
+         public int port;
+         public String username;
+         public String password;
+         public String secret;
++        public int type;
+ 
+         public long proxyCheckPingId;
+         public long ping;
+@@ -385,6 +391,11 @@ public class SharedConfig {
+         public long availableCheckTime;
+ 
+         public ProxyInfo(String address, int port, String username, String password, String secret) {
++            this(address, port, username, password, secret, TextUtils.isEmpty(secret) ? TYPE_SOCKS5 : TYPE_MTPROTO);
++        }
++
++        public ProxyInfo(String address, int port, String username, String password, String secret, int type) {
++            this.type = type;
+             this.address = address;
+             this.port = port;
+             this.username = username;
+@@ -404,7 +415,14 @@ public class SharedConfig {
+             }
+         }
+ 
++        public boolean isWeb() {
++            return type == TYPE_WEB;
++        }
++
+         public String getLink() {
++            if (type == TYPE_WEB) {
++                return WebProxyLink.buildLink(address, secret);
++            }
+             StringBuilder url = new StringBuilder(!TextUtils.isEmpty(secret) ? "https://t.me/proxy?" : "https://t.me/socks?");
+             try {
+                 url.append("server=").append(URLEncoder.encode(address, "UTF-8")).append("&").append("port=").append(port);
+@@ -1428,7 +1446,7 @@ public class SharedConfig {
+             if (count == -1) { // V2 or newer
+                 int version = data.readByte(false);
+ 
+-                if (version == PROXY_SCHEMA_V2) {
++                if (version == PROXY_SCHEMA_V2 || version == PROXY_SCHEMA_V3) {
+                     count = data.readInt32(false);
+ 
+                     for (int i = 0; i < count; i++) {
+@@ -1441,6 +1459,10 @@ public class SharedConfig {
+ 
+                         info.ping = data.readInt64(false);
+                         info.availableCheckTime = data.readInt64(false);
++                        if (version == PROXY_SCHEMA_V3) {
++                            // v2 and legacy lists keep their inferred type.
++                            info.type = data.readInt32(false);
++                        }
+ 
+                         proxyList.add(0, info);
+                         if (currentProxy == null && !TextUtils.isEmpty(proxyAddress)) {
+@@ -1504,6 +1526,7 @@ public class SharedConfig {
+ 
+             serializedData.writeInt64(info.ping);
+             serializedData.writeInt64(info.availableCheckTime);
++            serializedData.writeInt32(info.type);
+         }
+         SharedPreferences preferences = ApplicationLoader.applicationContext.getSharedPreferences("mainconfig", Activity.MODE_PRIVATE);
+         preferences.edit().putString("proxy_list", Base64.encodeToString(serializedData.toByteArray(), Base64.NO_WRAP)).apply();
+@@ -1515,7 +1538,7 @@ public class SharedConfig {
+         int count = proxyList.size();
+         for (int a = 0; a < count; a++) {
+             ProxyInfo info = proxyList.get(a);
+-            if (proxyInfo.address.equals(info.address) && proxyInfo.port == info.port && proxyInfo.username.equals(info.username) && proxyInfo.password.equals(info.password) && proxyInfo.secret.equals(info.secret)) {
++            if (proxyInfo.type == info.type && proxyInfo.address.equals(info.address) && proxyInfo.port == info.port && proxyInfo.username.equals(info.username) && proxyInfo.password.equals(info.password) && proxyInfo.secret.equals(info.secret)) {
+                 return info;
+             }
+         }
+@@ -1524,6 +1547,32 @@ public class SharedConfig {
+         return proxyInfo;
+     }
+ 
++    /**
++     * Resolves the explicit type of a stored proxy from its user visible fields. Entries that are
++     * not in the list keep the legacy inferred type.
++     */
++    public static int getProxyType(String address, int port, String secret) {
++        loadProxyList();
++        if (currentProxy != null && proxyMatches(currentProxy, address, port, secret)) {
++            return currentProxy.type;
++        }
++        for (int a = 0, count = proxyList.size(); a < count; a++) {
++            ProxyInfo info = proxyList.get(a);
++            if (proxyMatches(info, address, port, secret)) {
++                return info.type;
++            }
++        }
++        return TextUtils.isEmpty(secret) ? ProxyInfo.TYPE_SOCKS5 : ProxyInfo.TYPE_MTPROTO;
++    }
++
++    public static boolean isWebProxy(String address, int port, String secret) {
++        return getProxyType(address, port, secret) == ProxyInfo.TYPE_WEB;
++    }
++
++    private static boolean proxyMatches(ProxyInfo info, String address, int port, String secret) {
++        return info.port == port && info.address.equals(address == null ? "" : address) && info.secret.equals(secret == null ? "" : secret);
++    }
++
+     public static boolean isProxyEnabled() {
+         return MessagesController.getGlobalMainSettings().getBoolean("proxy_enabled", false) && currentProxy != null;
+     }
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/WebProxyFrame.java b/TMessagesProj/src/main/java/org/telegram/messenger/WebProxyFrame.java
+new file mode 100644
+index 00000000..b724d266
+--- /dev/null
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/WebProxyFrame.java
+@@ -0,0 +1,199 @@
++/*
++ * This is the source code of Telegram for Android v. 5.x.x.
++ * It is licensed under GNU GPL v. 2 or later.
++ * You should have received a copy of the license in this archive (see LICENSE).
++ *
++ * WEB proxy protocol v1 frame codec, see PROTOCOL.md of the relay project.
++ */
++
++package org.telegram.messenger;
++
++import java.util.ArrayList;
++import java.util.List;
++
++public final class WebProxyFrame {
++
++    public static final int HEADER_SIZE = 8;
++    public static final int MAX_PAYLOAD = 1024 * 1024;
++    public static final int DATA_CHUNK = 64 * 1024;
++    public static final int INITIAL_WINDOW = 4 * 1024 * 1024;
++    public static final int MAX_STREAM_ID = 0xFFFFFF;
++    public static final int MAX_BATCH_FRAMES = 4096;
++
++    public static final int TYPE_OPEN = 0x01;
++    public static final int TYPE_DATA = 0x02;
++    public static final int TYPE_CLOSE = 0x03;
++    public static final int TYPE_WINDOW = 0x04;
++    public static final int TYPE_PING = 0x05;
++    public static final int TYPE_PONG = 0x06;
++    public static final int TYPE_HELLO = 0x10;
++    public static final int TYPE_WELCOME = 0x11;
++    public static final int TYPE_BYE = 0x1f;
++
++    public static class InvalidFrameException extends Exception {
++        public InvalidFrameException(String message) {
++            super(message);
++        }
++    }
++
++    public final int type;
++    public final int streamId;
++    public final byte[] payload;
++
++    private WebProxyFrame(int type, int streamId, byte[] payload) {
++        this.type = type;
++        this.streamId = streamId;
++        this.payload = payload;
++    }
++
++    public static byte[] encode(int type, int streamId, byte[] payload, int offset, int length) {
++        if (streamId < 0 || streamId > MAX_STREAM_ID) {
++            throw new IllegalArgumentException("stream id exceeds 24 bits");
++        }
++        if (length < 0 || length > MAX_PAYLOAD) {
++            throw new IllegalArgumentException("payload exceeds the frame limit");
++        }
++        byte[] result = new byte[HEADER_SIZE + length];
++        result[0] = (byte) type;
++        result[1] = (byte) (streamId >> 16);
++        result[2] = (byte) (streamId >> 8);
++        result[3] = (byte) streamId;
++        result[4] = (byte) (length >>> 24);
++        result[5] = (byte) (length >>> 16);
++        result[6] = (byte) (length >>> 8);
++        result[7] = (byte) length;
++        if (length != 0) {
++            System.arraycopy(payload, offset, result, HEADER_SIZE, length);
++        }
++        return result;
++    }
++
++    public static byte[] hello() {
++        return encode(TYPE_HELLO, 0, new byte[]{1}, 0, 1);
++    }
++
++    public static byte[] open(int streamId) {
++        return encode(TYPE_OPEN, streamId, null, 0, 0);
++    }
++
++    public static byte[] close(int streamId) {
++        return encode(TYPE_CLOSE, streamId, null, 0, 0);
++    }
++
++    public static byte[] data(int streamId, byte[] payload, int offset, int length) {
++        if (length <= 0) {
++            throw new IllegalArgumentException("DATA payload must be nonempty");
++        }
++        return encode(TYPE_DATA, streamId, payload, offset, length);
++    }
++
++    public static byte[] window(int streamId, long delta) {
++        if (delta <= 0 || delta > 0xFFFFFFFFL) {
++            throw new IllegalArgumentException("WINDOW delta must be a nonzero u32");
++        }
++        byte[] payload = new byte[]{
++                (byte) (delta >>> 24),
++                (byte) (delta >>> 16),
++                (byte) (delta >>> 8),
++                (byte) delta
++        };
++        return encode(TYPE_WINDOW, streamId, payload, 0, payload.length);
++    }
++
++    public static byte[] pong(byte[] token) {
++        return encode(TYPE_PONG, 0, token, 0, token.length);
++    }
++
++    public long windowAmount() throws InvalidFrameException {
++        if (payload.length != 4) {
++            throw new InvalidFrameException("WINDOW payload must be four bytes");
++        }
++        long value = ((long) (payload[0] & 0xff) << 24)
++                | ((payload[1] & 0xff) << 16)
++                | ((payload[2] & 0xff) << 8)
++                | (payload[3] & 0xff);
++        if (value == 0) {
++            throw new InvalidFrameException("WINDOW delta must be nonzero");
++        }
++        return value;
++    }
++
++    /**
++     * Parses a complete relay-to-client frame batch. The bridge normally delivers exactly one
++     * frame per message, but a batch stays valid input.
++     */
++    public static List<WebProxyFrame> parseAll(byte[] input) throws InvalidFrameException {
++        List<WebProxyFrame> frames = new ArrayList<>(1);
++        int offset = 0;
++        while (offset != input.length) {
++            if (frames.size() == MAX_BATCH_FRAMES) {
++                throw new InvalidFrameException("frame batch contains too many frames");
++            }
++            if (input.length - offset < HEADER_SIZE) {
++                throw new InvalidFrameException("incomplete frame");
++            }
++            long length = ((long) (input[offset + 4] & 0xff) << 24)
++                    | ((input[offset + 5] & 0xff) << 16)
++                    | ((input[offset + 6] & 0xff) << 8)
++                    | (input[offset + 7] & 0xff);
++            if (length > MAX_PAYLOAD) {
++                throw new InvalidFrameException("frame payload exceeds limit");
++            }
++            if (length > input.length - offset - HEADER_SIZE) {
++                throw new InvalidFrameException("incomplete frame");
++            }
++            int type = input[offset] & 0xff;
++            int streamId = ((input[offset + 1] & 0xff) << 16)
++                    | ((input[offset + 2] & 0xff) << 8)
++                    | (input[offset + 3] & 0xff);
++            byte[] payload = new byte[(int) length];
++            System.arraycopy(input, offset + HEADER_SIZE, payload, 0, payload.length);
++            WebProxyFrame frame = new WebProxyFrame(type, streamId, payload);
++            frame.validateRelayShape();
++            frames.add(frame);
++            offset += HEADER_SIZE + payload.length;
++        }
++        if (frames.isEmpty()) {
++            throw new InvalidFrameException("empty frame batch");
++        }
++        return frames;
++    }
++
++    private void validateRelayShape() throws InvalidFrameException {
++        if (streamId == 0) {
++            switch (type) {
++                case TYPE_WELCOME:
++                    if (payload.length != 0) {
++                        throw new InvalidFrameException("WELCOME requires an empty payload");
++                    }
++                    return;
++                case TYPE_PING:
++                    if (payload.length > 64) {
++                        throw new InvalidFrameException("PING token is too long");
++                    }
++                    return;
++                case TYPE_BYE:
++                    return;
++                default:
++                    throw new InvalidFrameException("frame type " + type + " is invalid on stream zero");
++            }
++        }
++        switch (type) {
++            case TYPE_CLOSE:
++                if (payload.length != 0) {
++                    throw new InvalidFrameException("CLOSE requires an empty payload");
++                }
++                return;
++            case TYPE_DATA:
++                if (payload.length == 0) {
++                    throw new InvalidFrameException("DATA payload must be nonempty");
++                }
++                return;
++            case TYPE_WINDOW:
++                windowAmount();
++                return;
++            default:
++                throw new InvalidFrameException("frame type " + type + " is invalid relay-to-client");
++        }
++    }
++}
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/WebProxyLink.java b/TMessagesProj/src/main/java/org/telegram/messenger/WebProxyLink.java
+new file mode 100644
+index 00000000..c9ce3aee
+--- /dev/null
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/WebProxyLink.java
+@@ -0,0 +1,247 @@
++/*
++ * This is the source code of Telegram for Android v. 5.x.x.
++ * It is licensed under GNU GPL v. 2 or later.
++ * You should have received a copy of the license in this archive (see LICENSE).
++ *
++ * Canonical WEB proxy hostname, secret, capability and link handling.
++ * See PROTOCOL.md and ANDROID.md of the relay project.
++ */
++
++package org.telegram.messenger;
++
++import android.text.TextUtils;
++import android.util.Base64;
++
++import java.io.UnsupportedEncodingException;
++import java.net.IDN;
++import java.net.URLDecoder;
++import java.net.URLEncoder;
++import java.util.Locale;
++
++import javax.crypto.Mac;
++import javax.crypto.spec.SecretKeySpec;
++
++public final class WebProxyLink {
++
++    /** Frozen v1 domain separation label, it is not restricted to Telegram Desktop. */
++    private static final String CAPABILITY_CONTEXT = "tdesktop-web-proxy-bridge-v1\n";
++
++    /** WEB always uses HTTPS on 443, the port is never part of the link. */
++    public static final int PORT = 443;
++
++    public final String hostname;
++    public final String secret;
++
++    private WebProxyLink(String hostname, String secret) {
++        this.hostname = hostname;
++        this.secret = secret;
++    }
++
++    /**
++     * Canonical lowercase ASCII/IDNA A-label hostname, mirroring the relay's ValidateHostname.
++     */
++    public static boolean isValidHostname(String host) {
++        if (TextUtils.isEmpty(host) || host.length() > 253 || host.endsWith(".")) {
++            return false;
++        }
++        if (host.indexOf('.') < 0) {
++            return false;
++        }
++        for (int a = 0; a < host.length(); a++) {
++            char character = host.charAt(a);
++            if (character > 127) {
++                return false;
++            }
++            if (":/@?#[]".indexOf(character) >= 0) {
++                return false;
++            }
++        }
++        String[] labels = host.split("\\.", -1);
++        boolean numericOnly = true;
++        for (int a = 0; a < labels.length; a++) {
++            String label = labels[a];
++            if (label.length() == 0 || label.length() > 63 || label.charAt(0) == '-' || label.charAt(label.length() - 1) == '-') {
++                return false;
++            }
++            for (int b = 0; b < label.length(); b++) {
++                char character = label.charAt(b);
++                boolean digit = character >= '0' && character <= '9';
++                if (!digit && (character < 'a' || character > 'z') && character != '-') {
++                    return false;
++                }
++                if (!digit) {
++                    numericOnly = false;
++                }
++            }
++        }
++        // A dotted quad is an IP address literal, not a DNS hostname.
++        return !(numericOnly && labels.length == 4);
++    }
++
++    /**
++     * Decodes a client facing MTProxy secret into the 16 bytes, or 17 bytes with the leading
++     * {@code dd} random padding marker, that key the bridge capability.
++     */
++    public static byte[] decodeSecret(String value) {
++        if (value == null) {
++            return null;
++        }
++        value = value.trim();
++        byte[] decoded = null;
++        if (value.length() == 32 || value.length() == 34) {
++            decoded = decodeHex(value);
++        }
++        if (decoded == null) {
++            decoded = decodeBase64(value, Base64.URL_SAFE);
++        }
++        if (decoded == null) {
++            decoded = decodeBase64(value, Base64.DEFAULT);
++        }
++        if (decoded == null || (decoded.length != 16 && decoded.length != 17)) {
++            return null;
++        }
++        if (decoded.length == 17 && (decoded[0] & 0xff) != 0xdd) {
++            return null;
++        }
++        return decoded;
++    }
++
++    public static boolean isValidSecret(String value) {
++        return decodeSecret(value) != null;
++    }
++
++    private static byte[] decodeHex(String value) {
++        byte[] result = new byte[value.length() / 2];
++        for (int a = 0; a < result.length; a++) {
++            int high = Character.digit(value.charAt(a * 2), 16);
++            int low = Character.digit(value.charAt(a * 2 + 1), 16);
++            if (high < 0 || low < 0) {
++                return null;
++            }
++            result[a] = (byte) ((high << 4) | low);
++        }
++        return result;
++    }
++
++    private static byte[] decodeBase64(String value, int flags) {
++        try {
++            return Base64.decode(value, flags | Base64.NO_WRAP);
++        } catch (Exception ignore) {
++            return null;
++        }
++    }
++
++    /**
++     * base64url-no-padding(HMAC-SHA256(key = secret bytes, message = context + hostname)).
++     */
++    public static String capability(String hostname, byte[] secret) {
++        try {
++            Mac mac = Mac.getInstance("HmacSHA256");
++            mac.init(new SecretKeySpec(secret, "HmacSHA256"));
++            byte[] digest = mac.doFinal((CAPABILITY_CONTEXT + hostname).getBytes("UTF-8"));
++            return Base64.encodeToString(digest, Base64.URL_SAFE | Base64.NO_PADDING | Base64.NO_WRAP);
++        } catch (Exception e) {
++            FileLog.e(e);
++            return null;
++        }
++    }
++
++    public static String bridgeUrl(String hostname, String capability, String nonce) {
++        return "https://" + hostname + "/?bridge=" + capability + "#android=" + nonce;
++    }
++
++    public static String origin(String hostname) {
++        return "https://" + hostname;
++    }
++
++    public static String buildLink(String hostname, String secret) {
++        try {
++            return "https://t.me/webproxy?server=" + URLEncoder.encode(hostname, "UTF-8")
++                    + "&secret=" + URLEncoder.encode(secret, "UTF-8");
++        } catch (UnsupportedEncodingException ignore) {
++            return "https://t.me/webproxy?server=" + hostname + "&secret=" + secret;
++        }
++    }
++
++    /**
++     * Accepts {@code https://t.me/webproxy?...}, {@code tg://webproxy?...} and the {@code host}
++     * legacy input alias. Returns null when the link is not a canonical WEB proxy link.
++     */
++    public static WebProxyLink parse(String url) {
++        if (TextUtils.isEmpty(url)) {
++            return null;
++        }
++        String query = null;
++        String lower = url.toLowerCase(Locale.US);
++        final String[] prefixes = {"t.me/webproxy?", "tg://webproxy?", "telegram.me/webproxy?", "telegram.dog/webproxy?"};
++        for (int a = 0; a < prefixes.length; a++) {
++            int index = lower.indexOf(prefixes[a]);
++            if (index >= 0) {
++                query = url.substring(index + prefixes[a].length());
++                break;
++            }
++        }
++        if (query == null) {
++            return null;
++        }
++        int cut = query.indexOf('#');
++        if (cut >= 0) {
++            query = query.substring(0, cut);
++        }
++        return fromQuery(query);
++    }
++
++    public static WebProxyLink fromQuery(String query) {
++        String hostname = null;
++        String secret = null;
++        String[] parts = query.split("&");
++        for (int a = 0; a < parts.length; a++) {
++            int equals = parts[a].indexOf('=');
++            if (equals <= 0) {
++                continue;
++            }
++            String key = parts[a].substring(0, equals).toLowerCase(Locale.US);
++            String value = decodeComponent(parts[a].substring(equals + 1));
++            if ("server".equals(key) || ("host".equals(key) && hostname == null)) {
++                hostname = value;
++            } else if ("secret".equals(key)) {
++                secret = value;
++            }
++        }
++        return from(hostname, secret);
++    }
++
++    public static WebProxyLink from(String hostname, String secret) {
++        if (hostname == null || secret == null) {
++            return null;
++        }
++        hostname = hostname.trim().toLowerCase(Locale.US);
++        secret = secret.trim();
++        boolean unicode = false;
++        for (int a = 0; a < hostname.length(); a++) {
++            if (hostname.charAt(a) > 127) {
++                unicode = true;
++                break;
++            }
++        }
++        if (unicode) {
++            try {
++                hostname = IDN.toASCII(hostname, IDN.ALLOW_UNASSIGNED).toLowerCase(Locale.US);
++            } catch (Exception ignore) {
++                return null;
++            }
++        }
++        if (!isValidHostname(hostname) || !isValidSecret(secret)) {
++            return null;
++        }
++        return new WebProxyLink(hostname, secret);
++    }
++
++    private static String decodeComponent(String value) {
++        try {
++            return URLDecoder.decode(value, "UTF-8");
++        } catch (Exception ignore) {
++            return value;
++        }
++    }
++}
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/WebProxyTransport.java b/TMessagesProj/src/main/java/org/telegram/messenger/WebProxyTransport.java
+new file mode 100644
+index 00000000..a5f76569
+--- /dev/null
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/WebProxyTransport.java
+@@ -0,0 +1,1170 @@
++/*
++ * This is the source code of Telegram for Android v. 5.x.x.
++ * It is licensed under GNU GPL v. 2 or later.
++ * You should have received a copy of the license in this archive (see LICENSE).
++ *
++ * WEB proxy carrier: a loopback MTProxy listener whose logical streams are multiplexed
++ * through a private, origin scoped WebView that runs the relay's bridge page.
++ * See PROTOCOL.md and ANDROID.md of the relay project.
++ */
++
++package org.telegram.messenger;
++
++import android.annotation.SuppressLint;
++import android.content.Context;
++import android.net.Uri;
++import android.os.Build;
++import android.os.Handler;
++import android.os.Looper;
++import android.util.Base64;
++import android.webkit.CookieManager;
++import android.webkit.ConsoleMessage;
++import android.webkit.GeolocationPermissions;
++import android.webkit.PermissionRequest;
++import android.webkit.RenderProcessGoneDetail;
++import android.webkit.SslErrorHandler;
++import android.webkit.ValueCallback;
++import android.webkit.WebChromeClient;
++import android.webkit.WebResourceRequest;
++import android.webkit.WebResourceResponse;
++import android.webkit.WebSettings;
++import android.webkit.WebView;
++import android.webkit.WebViewClient;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import androidx.webkit.JavaScriptReplyProxy;
++import androidx.webkit.WebMessageCompat;
++import androidx.webkit.WebSettingsCompat;
++import androidx.webkit.WebViewCompat;
++import androidx.webkit.WebViewFeature;
++
++import org.json.JSONObject;
++
++import java.io.ByteArrayInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.net.InetAddress;
++import java.net.InetSocketAddress;
++import java.net.ServerSocket;
++import java.net.Socket;
++import java.security.SecureRandom;
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.Locale;
++import java.util.Map;
++import java.util.concurrent.LinkedBlockingQueue;
++
++public final class WebProxyTransport {
++
++    public static final String LOOPBACK_ADDRESS = "127.0.0.1";
++    /** Fail closed target: nothing listens there, so tgnet never reaches Telegram directly. */
++    public static final int UNUSABLE_PORT = 1;
++
++    public static final int STATE_IDLE = 0;
++    public static final int STATE_UNSUPPORTED = 1;
++    public static final int STATE_CONNECTING = 2;
++    public static final int STATE_CONNECTED = 3;
++    public static final int STATE_RECONNECTING = 4;
++    public static final int STATE_FAILED = 5;
++
++    private static final String JS_OBJECT_NAME = "TelegramWebProxy";
++    private static final String INIT_MESSAGE = "tproxy-android-init";
++
++    private static final int MAX_STREAMS = 64;
++    private static final int CARRIER_MESSAGE_BYTES = 256 * 1024;
++    private static final int CARRIER_MESSAGE_FRAMES = 256;
++    private static final long OUTBOUND_QUEUE_LIMIT = 32 * 1024 * 1024;
++    private static final long FRAME_ITEM_COST = 256;
++    private static final long HANDSHAKE_TIMEOUT = 45000;
++    private static final long CARRIER_IDLE_TIMEOUT = 120000;
++    private static final long WATCHDOG_INTERVAL = 15000;
++    private static final long RETRY_MIN_DELAY = 1000;
++    private static final long RETRY_MAX_DELAY = 30000;
++    private static final long FOREGROUND_POLL_DELAY = 3000;
++    private static final long DRAIN_TIMEOUT = 5000;
++
++    private static volatile WebProxyTransport instance;
++
++    public static WebProxyTransport getInstance() {
++        WebProxyTransport local = instance;
++        if (local == null) {
++            synchronized (WebProxyTransport.class) {
++                local = instance;
++                if (local == null) {
++                    local = instance = new WebProxyTransport();
++                }
++            }
++        }
++        return local;
++    }
++
++    /**
++     * The installed Android System WebView must expose the exact origin binary message boundary.
++     * A missing feature fails closed: the carrier never falls back to a direct connection.
++     */
++    public static boolean isSupported() {
++        try {
++            return WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)
++                    && WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_ARRAY_BUFFER)
++                    && WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT);
++        } catch (Throwable e) {
++            FileLog.e(e);
++            return false;
++        }
++    }
++
++    private final Object lock = new Object();
++    private final Handler uiHandler = new Handler(Looper.getMainLooper());
++    private final SecureRandom random = new SecureRandom();
++    private final HashMap<Integer, Stream> streams = new HashMap<>();
++    private final ArrayDeque<byte[]> outbound = new ArrayDeque<>();
++
++    private boolean running;
++    private boolean carrierUsable;
++    private boolean carrierReady;
++    private boolean flushScheduled;
++    private boolean watchdogScheduled;
++    private int state = STATE_IDLE;
++    private int generation;
++    private int sessionGeneration;
++    private int nextStreamId = 1;
++    private long outboundCharge;
++    private long retryDelay = RETRY_MIN_DELAY;
++    private long carrierStartedAt;
++    private long lastCarrierActivity;
++    private long uplinkBytes;
++    private long downlinkBytes;
++
++    private String hostname;
++    private String secret;
++    private String origin;
++    private String bridgeUrl;
++    private String nonce;
++    private int localPort;
++
++    private ServerSocket listener;
++    private Thread acceptThread;
++
++    private WebView webView;
++    private JavaScriptReplyProxy replyProxy;
++
++    private WebProxyTransport() {
++    }
++
++    public int getState() {
++        synchronized (lock) {
++            return state;
++        }
++    }
++
++    public boolean isRunning() {
++        synchronized (lock) {
++            return running;
++        }
++    }
++
++    public String getHostname() {
++        synchronized (lock) {
++            return hostname;
++        }
++    }
++
++    /**
++     * Binds the loopback MTProxy listener and starts the carrier. Returns the loopback port that
++     * native tgnet must connect to, or 0 when the listener itself could not be bound. Calling it
++     * again with the same hostname and secret is a no-op that returns the same port.
++     */
++    public int start(String proxyHostname, String proxySecret) {
++        WebProxyLink link = WebProxyLink.from(proxyHostname, proxySecret);
++        if (link == null) {
++            FileLog.e("web proxy: refusing a non canonical hostname or secret");
++            stop();
++            return 0;
++        }
++        byte[] secretBytes = WebProxyLink.decodeSecret(link.secret);
++        String capability = WebProxyLink.capability(link.hostname, secretBytes);
++        java.util.Arrays.fill(secretBytes, (byte) 0);
++        if (capability == null) {
++            stop();
++            return 0;
++        }
++        synchronized (lock) {
++            if (running && link.hostname.equals(hostname) && link.secret.equals(secret) && listener != null) {
++                return localPort;
++            }
++        }
++        stop();
++        byte[] nonceBytes = new byte[32];
++        random.nextBytes(nonceBytes);
++        String localNonce = Base64.encodeToString(nonceBytes, Base64.URL_SAFE | Base64.NO_PADDING | Base64.NO_WRAP);
++        ServerSocket socket;
++        try {
++            socket = new ServerSocket();
++            socket.setReuseAddress(false);
++            socket.bind(new InetSocketAddress(InetAddress.getByName(LOOPBACK_ADDRESS), 0), 64);
++        } catch (Exception e) {
++            FileLog.e(e);
++            return 0;
++        }
++        boolean supported = isSupported();
++        synchronized (lock) {
++            hostname = link.hostname;
++            secret = link.secret;
++            origin = WebProxyLink.origin(link.hostname);
++            nonce = localNonce;
++            bridgeUrl = WebProxyLink.bridgeUrl(link.hostname, capability, localNonce);
++            listener = socket;
++            localPort = socket.getLocalPort();
++            running = true;
++            carrierUsable = supported;
++            carrierReady = false;
++            retryDelay = RETRY_MIN_DELAY;
++            generation++;
++            sessionGeneration++;
++            state = supported ? STATE_CONNECTING : STATE_UNSUPPORTED;
++            acceptThread = new Thread(new AcceptLoop(socket, sessionGeneration), "WebProxyAccept");
++            acceptThread.setDaemon(true);
++            acceptThread.start();
++        }
++        if (BuildVars.LOGS_ENABLED) {
++            FileLog.d("web proxy: listening on " + LOOPBACK_ADDRESS + ":" + localPort + " for " + link.hostname
++                    + (supported ? "" : ", unsupported system webview"));
++        }
++        if (supported) {
++            uiHandler.post(this::createCarrier);
++            scheduleWatchdog();
++        }
++        return localPort;
++    }
++
++    /**
++     * Closes the carrier session, every logical stream and the loopback listener.
++     */
++    public void stop() {
++        ServerSocket socket;
++        ArrayList<Stream> live;
++        synchronized (lock) {
++            if (!running && listener == null && streams.isEmpty()) {
++                return;
++            }
++            running = false;
++            carrierUsable = false;
++            carrierReady = false;
++            state = STATE_IDLE;
++            generation++;
++            sessionGeneration++;
++            socket = listener;
++            listener = null;
++            localPort = 0;
++            hostname = null;
++            secret = null;
++            origin = null;
++            bridgeUrl = null;
++            nonce = null;
++            live = new ArrayList<>(streams.values());
++            streams.clear();
++            outbound.clear();
++            outboundCharge = 0;
++        }
++        if (socket != null) {
++            try {
++                socket.close();
++            } catch (Exception ignore) {
++            }
++        }
++        for (int a = 0; a < live.size(); a++) {
++            live.get(a).shutdown();
++        }
++        uiHandler.post(this::destroyCarrier);
++    }
++
++    // region loopback listener
++
++    private final class AcceptLoop implements Runnable {
++
++        private final ServerSocket socket;
++        private final int session;
++
++        private AcceptLoop(ServerSocket socket, int session) {
++            this.socket = socket;
++            this.session = session;
++        }
++
++        @Override
++        public void run() {
++            while (true) {
++                Socket accepted;
++                try {
++                    accepted = socket.accept();
++                } catch (Exception e) {
++                    break;
++                }
++                if (!openStream(accepted, session)) {
++                    closeQuietly(accepted);
++                }
++            }
++        }
++    }
++
++    private boolean openStream(Socket socket, int session) {
++        Stream stream;
++        synchronized (lock) {
++            if (!running || sessionGeneration != session || !carrierUsable) {
++                return false;
++            }
++            if (streams.size() >= MAX_STREAMS) {
++                FileLog.e("web proxy: too many logical streams");
++                return false;
++            }
++            if (nextStreamId > WebProxyFrame.MAX_STREAM_ID) {
++                // Stream ids are never reused inside one relay session.
++                failCarrierLocked("stream id space exhausted");
++                return false;
++            }
++            try {
++                socket.setTcpNoDelay(true);
++                socket.setKeepAlive(true);
++                socket.setSoTimeout(0);
++            } catch (Exception e) {
++                return false;
++            }
++            try {
++                stream = new Stream(nextStreamId++, socket, generation);
++            } catch (IOException e) {
++                FileLog.e(e);
++                return false;
++            }
++            streams.put(stream.id, stream);
++        }
++        enqueue(WebProxyFrame.open(stream.id));
++        stream.start();
++        return true;
++    }
++
++    private final class Stream {
++
++        private final int id;
++        private final int carrierGeneration;
++        private final Socket socket;
++        private final InputStream input;
++        private final OutputStream output;
++        private final LinkedBlockingQueue<byte[]> writeQueue = new LinkedBlockingQueue<>();
++        private final Object creditLock = new Object();
++        private final byte[] POISON = new byte[0];
++
++        private long sendCredit = WebProxyFrame.INITIAL_WINDOW;
++        private volatile boolean closed;
++        private volatile boolean aborted;
++        private Thread reader;
++        private Thread writer;
++
++        private Stream(int id, Socket socket, int carrierGeneration) throws IOException {
++            this.id = id;
++            this.socket = socket;
++            this.carrierGeneration = carrierGeneration;
++            this.input = socket.getInputStream();
++            this.output = socket.getOutputStream();
++        }
++
++        private void start() {
++            reader = new Thread(this::readLoop, "WebProxyRead-" + id);
++            reader.setDaemon(true);
++            writer = new Thread(this::writeLoop, "WebProxyWrite-" + id);
++            writer.setDaemon(true);
++            reader.start();
++            writer.start();
++        }
++
++        private void readLoop() {
++            byte[] buffer = new byte[WebProxyFrame.DATA_CHUNK];
++            while (!closed) {
++                int allowed = awaitCredit();
++                if (allowed <= 0) {
++                    break;
++                }
++                int read;
++                try {
++                    read = input.read(buffer, 0, allowed);
++                } catch (Exception e) {
++                    break;
++                }
++                if (read <= 0) {
++                    break;
++                }
++                synchronized (creditLock) {
++                    sendCredit -= read;
++                }
++                enqueue(WebProxyFrame.data(id, buffer, 0, read));
++            }
++            // EOF or a local failure aborts the logical stream, exactly like the plain TCP path.
++            closeStream(id, carrierGeneration, true);
++        }
++
++        private int awaitCredit() {
++            synchronized (creditLock) {
++                while (!closed && sendCredit <= 0) {
++                    try {
++                        creditLock.wait(1000);
++                    } catch (InterruptedException e) {
++                        return 0;
++                    }
++                }
++                if (closed) {
++                    return 0;
++                }
++                return (int) Math.min(WebProxyFrame.DATA_CHUNK, sendCredit);
++            }
++        }
++
++        private void grantCredit(long delta) {
++            synchronized (creditLock) {
++                sendCredit += delta;
++                if (sendCredit > 0xFFFFFFFFL) {
++                    sendCredit = 0xFFFFFFFFL;
++                }
++                creditLock.notifyAll();
++            }
++        }
++
++        private void writeLoop() {
++            while (true) {
++                byte[] chunk;
++                try {
++                    chunk = writeQueue.take();
++                } catch (InterruptedException e) {
++                    break;
++                }
++                if (chunk == POISON || aborted) {
++                    break;
++                }
++                try {
++                    output.write(chunk);
++                    output.flush();
++                } catch (Exception e) {
++                    closeStream(id, carrierGeneration, true);
++                    break;
++                }
++                if (!closed) {
++                    // The bytes reached the local Telegram networking engine, return the credit.
++                    enqueue(WebProxyFrame.window(id, chunk.length));
++                }
++            }
++            closeQuietly(socket);
++        }
++
++        private void deliver(byte[] payload) {
++            if (!closed) {
++                writeQueue.offer(payload);
++            }
++        }
++
++        private void shutdown() {
++            shutdown(false);
++        }
++
++        /**
++         * A relay CLOSE ends the logical stream, but bytes it already delivered are still handed
++         * to the local socket before the FIN. Every other reason aborts immediately, exactly like
++         * the plain TCP path.
++         */
++        private void shutdown(boolean drain) {
++            closed = true;
++            synchronized (creditLock) {
++                creditLock.notifyAll();
++            }
++            if (drain) {
++                // The writer drains what is already queued, including a chunk it is writing right
++                // now, and closes the socket when it reaches this marker.
++                writeQueue.offer(POISON);
++                try {
++                    socket.shutdownInput();
++                } catch (Exception ignore) {
++                }
++                // Bound the drain: an unread local socket must not pin the writer thread.
++                uiHandler.postDelayed(() -> {
++                    aborted = true;
++                    closeQuietly(socket);
++                }, DRAIN_TIMEOUT);
++                return;
++            }
++            aborted = true;
++            writeQueue.clear();
++            writeQueue.offer(POISON);
++            closeQuietly(socket);
++        }
++    }
++
++    private void closeStream(int id, int carrierGeneration, boolean notifyRelay) {
++        Stream stream;
++        synchronized (lock) {
++            if (generation != carrierGeneration) {
++                return;
++            }
++            stream = streams.remove(id);
++            if (stream == null) {
++                return;
++            }
++        }
++        stream.shutdown(!notifyRelay);
++        if (notifyRelay) {
++            enqueue(WebProxyFrame.close(id));
++        }
++    }
++
++    private void closeAllStreams() {
++        ArrayList<Stream> live;
++        synchronized (lock) {
++            live = new ArrayList<>(streams.values());
++            streams.clear();
++        }
++        for (int a = 0; a < live.size(); a++) {
++            live.get(a).shutdown();
++        }
++    }
++
++    private static void closeQuietly(Socket socket) {
++        try {
++            socket.close();
++        } catch (Exception ignore) {
++        }
++    }
++
++    // endregion
++
++    // region carrier queue
++
++    private void enqueue(byte[] frame) {
++        synchronized (lock) {
++            if (!running || !carrierUsable) {
++                return;
++            }
++            outboundCharge += frame.length + FRAME_ITEM_COST;
++            if (outboundCharge > OUTBOUND_QUEUE_LIMIT) {
++                failCarrierLocked("outbound carrier queue overflow");
++                return;
++            }
++            outbound.add(frame);
++            scheduleFlushLocked();
++        }
++    }
++
++    private void scheduleFlushLocked() {
++        if (flushScheduled || !carrierReady || replyProxy == null || outbound.isEmpty()) {
++            return;
++        }
++        flushScheduled = true;
++        uiHandler.post(this::flush);
++    }
++
++    private void flush() {
++        while (true) {
++            byte[] batch;
++            JavaScriptReplyProxy proxy;
++            synchronized (lock) {
++                if (!running || !carrierUsable || !carrierReady || replyProxy == null || outbound.isEmpty()) {
++                    flushScheduled = false;
++                    return;
++                }
++                proxy = replyProxy;
++                int bytes = 0;
++                int frames = 0;
++                for (byte[] frame : outbound) {
++                    if (frames != 0 && (bytes + frame.length > CARRIER_MESSAGE_BYTES || frames >= CARRIER_MESSAGE_FRAMES)) {
++                        break;
++                    }
++                    bytes += frame.length;
++                    frames++;
++                }
++                batch = new byte[bytes];
++                int offset = 0;
++                for (int a = 0; a < frames; a++) {
++                    byte[] frame = outbound.poll();
++                    System.arraycopy(frame, 0, batch, offset, frame.length);
++                    offset += frame.length;
++                    outboundCharge -= frame.length + FRAME_ITEM_COST;
++                }
++                uplinkBytes += bytes;
++            }
++            try {
++                proxy.postMessage(batch);
++            } catch (Throwable e) {
++                FileLog.e(e);
++                failCarrier("carrier message rejected");
++                return;
++            }
++        }
++    }
++
++    // endregion
++
++    // region carrier lifecycle
++
++    @SuppressLint("SetJavaScriptEnabled")
++    private void createCarrier() {
++        String url;
++        String allowedOrigin;
++        int carrierGeneration;
++        synchronized (lock) {
++            if (!running || !carrierUsable || webView != null) {
++                return;
++            }
++            url = bridgeUrl;
++            allowedOrigin = origin;
++            carrierGeneration = generation;
++            carrierStartedAt = System.currentTimeMillis();
++            lastCarrierActivity = carrierStartedAt;
++            if (state != STATE_RECONNECTING) {
++                state = STATE_CONNECTING;
++            }
++        }
++        WebView view;
++        try {
++            Context context = ApplicationLoader.applicationContext;
++            view = new WebView(context);
++            WebSettings settings = view.getSettings();
++            settings.setJavaScriptEnabled(true);
++            settings.setDomStorageEnabled(false);
++            settings.setDatabaseEnabled(false);
++            settings.setCacheMode(WebSettings.LOAD_NO_CACHE);
++            settings.setAllowFileAccess(false);
++            settings.setAllowContentAccess(false);
++            settings.setAllowFileAccessFromFileURLs(false);
++            settings.setAllowUniversalAccessFromFileURLs(false);
++            settings.setBlockNetworkImage(true);
++            settings.setLoadsImagesAutomatically(false);
++            settings.setGeolocationEnabled(false);
++            settings.setJavaScriptCanOpenWindowsAutomatically(false);
++            settings.setSupportMultipleWindows(false);
++            settings.setSaveFormData(false);
++            settings.setSupportZoom(false);
++            settings.setMediaPlaybackRequiresUserGesture(true);
++            settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
++            if (WebViewFeature.isFeatureSupported(WebViewFeature.SAFE_BROWSING_ENABLE)) {
++                WebSettingsCompat.setSafeBrowsingEnabled(settings, true);
++            }
++            // Per WebView, unlike the process global CookieManager.setAcceptCookie.
++            try {
++                CookieManager.getInstance().setAcceptThirdPartyCookies(view, false);
++            } catch (Throwable ignore) {
++            }
++            view.setWebViewClient(new CarrierWebViewClient(carrierGeneration, allowedOrigin, url));
++            view.setWebChromeClient(new CarrierWebChromeClient());
++            view.setDownloadListener((downloadUrl, userAgent, disposition, mimeType, length) -> {
++            });
++            view.setNetworkAvailable(true);
++            WebViewCompat.addDocumentStartJavaScript(view, hardeningScript(allowedOrigin), Collections.singleton(allowedOrigin));
++            WebViewCompat.addWebMessageListener(view, JS_OBJECT_NAME, Collections.singleton(allowedOrigin),
++                    new CarrierMessageListener(carrierGeneration, allowedOrigin));
++        } catch (Throwable e) {
++            FileLog.e(e);
++            synchronized (lock) {
++                carrierUsable = false;
++                state = STATE_UNSUPPORTED;
++            }
++            closeAllStreams();
++            return;
++        }
++        synchronized (lock) {
++            if (!running || generation != carrierGeneration) {
++                view.destroy();
++                return;
++            }
++            webView = view;
++        }
++        view.loadUrl(url);
++    }
++
++    private void destroyCarrier() {
++        WebView view;
++        synchronized (lock) {
++            view = webView;
++            webView = null;
++            replyProxy = null;
++            carrierReady = false;
++        }
++        if (view == null) {
++            return;
++        }
++        try {
++            view.stopLoading();
++            view.loadUrl("about:blank");
++            view.setWebViewClient(new WebViewClient());
++            view.setWebChromeClient(null);
++            if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
++                WebViewCompat.removeWebMessageListener(view, JS_OBJECT_NAME);
++            }
++            view.clearHistory();
++            view.clearCache(true);
++            view.clearFormData();
++            view.destroy();
++        } catch (Throwable e) {
++            FileLog.e(e);
++        }
++    }
++
++    private void failCarrier(String reason) {
++        synchronized (lock) {
++            failCarrierLocked(reason);
++        }
++    }
++
++    private void failCarrierLocked(String reason) {
++        if (!running || !carrierUsable) {
++            return;
++        }
++        if (BuildVars.LOGS_ENABLED) {
++            FileLog.d("web proxy: carrier failed, " + reason);
++        }
++        carrierReady = false;
++        replyProxy = null;
++        outbound.clear();
++        outboundCharge = 0;
++        state = STATE_RECONNECTING;
++        generation++;
++        long delay = retryDelay;
++        retryDelay = Math.min(retryDelay * 2, RETRY_MAX_DELAY);
++        uiHandler.post(() -> {
++            destroyCarrier();
++            closeAllStreams();
++        });
++        uiHandler.postDelayed(new RetryCarrier(), delay);
++    }
++
++    private final class RetryCarrier implements Runnable {
++
++        @Override
++        public void run() {
++            synchronized (lock) {
++                if (!running || !carrierUsable || webView != null) {
++                    return;
++                }
++            }
++            // The carrier is foreground scoped: a WebView created while Telegram is backgrounded
++            // may be throttled or killed straight away, so wait for the next foreground transition.
++            if (ApplicationLoader.mainInterfacePaused) {
++                uiHandler.postDelayed(this, FOREGROUND_POLL_DELAY);
++                return;
++            }
++            createCarrier();
++        }
++    }
++
++    private void scheduleWatchdog() {
++        synchronized (lock) {
++            if (watchdogScheduled) {
++                return;
++            }
++            watchdogScheduled = true;
++        }
++        uiHandler.postDelayed(this::watchdog, WATCHDOG_INTERVAL);
++    }
++
++    private void watchdog() {
++        synchronized (lock) {
++            watchdogScheduled = false;
++            if (!running) {
++                return;
++            }
++            if (carrierUsable && webView != null) {
++                long now = System.currentTimeMillis();
++                if (!carrierReady && now - carrierStartedAt > HANDSHAKE_TIMEOUT) {
++                    failCarrierLocked("bridge handshake timed out");
++                } else if (carrierReady && !outbound.isEmpty() && now - lastCarrierActivity > CARRIER_IDLE_TIMEOUT) {
++                    failCarrierLocked("bridge stopped acknowledging traffic");
++                }
++            }
++            watchdogScheduled = true;
++        }
++        uiHandler.postDelayed(this::watchdog, WATCHDOG_INTERVAL);
++    }
++
++    // endregion
++
++    // region webview boundary
++
++    private final class CarrierMessageListener implements WebViewCompat.WebMessageListener {
++
++        private final int carrierGeneration;
++        private final String allowedOrigin;
++
++        private CarrierMessageListener(int carrierGeneration, String allowedOrigin) {
++            this.carrierGeneration = carrierGeneration;
++            this.allowedOrigin = allowedOrigin;
++        }
++
++        @Override
++        public void onPostMessage(@NonNull WebView view, @NonNull WebMessageCompat message, @NonNull Uri sourceOrigin,
++                                  boolean isMainFrame, @NonNull JavaScriptReplyProxy proxy) {
++            if (!isMainFrame || !allowedOrigin.equals(sourceOrigin.toString())) {
++                return;
++            }
++            synchronized (lock) {
++                if (!running || generation != carrierGeneration || webView != view) {
++                    return;
++                }
++                lastCarrierActivity = System.currentTimeMillis();
++            }
++            try {
++                if (message.getType() == WebMessageCompat.TYPE_ARRAY_BUFFER) {
++                    onCarrierFrames(carrierGeneration, message.getArrayBuffer());
++                } else {
++                    onCarrierControl(carrierGeneration, message.getData(), proxy);
++                }
++            } catch (Throwable e) {
++                FileLog.e(e);
++                failCarrier("invalid bridge message");
++            }
++        }
++    }
++
++    private void onCarrierControl(int carrierGeneration, String value, JavaScriptReplyProxy proxy) {
++        if (value == null) {
++            return;
++        }
++        JSONObject object;
++        try {
++            object = new JSONObject(value);
++        } catch (Exception e) {
++            failCarrier("malformed bridge control value");
++            return;
++        }
++        String type = object.optString("t");
++        if (INIT_MESSAGE.equals(type)) {
++            byte[] hello;
++            synchronized (lock) {
++                if (!running || generation != carrierGeneration || replyProxy != null) {
++                    return;
++                }
++                if (object.optInt("v") != 1 || !equalsConstantTime(nonce, object.optString("nonce"))) {
++                    failCarrierLocked("bridge presented an invalid nonce");
++                    return;
++                }
++                replyProxy = proxy;
++                hello = WebProxyFrame.hello();
++            }
++            // HELLO is the bootstrap message: it starts the relay session behind the bridge.
++            try {
++                proxy.postMessage(hello);
++            } catch (Throwable e) {
++                FileLog.e(e);
++                failCarrier("bridge rejected HELLO");
++            }
++        } else if ("status".equals(type)) {
++            String reported = object.optString("state");
++            synchronized (lock) {
++                if (!running || generation != carrierGeneration) {
++                    return;
++                }
++                if ("failed".equals(reported)) {
++                    failCarrierLocked("bridge reported a carrier failure");
++                } else if ("reconnecting".equals(reported) && state == STATE_CONNECTED) {
++                    state = STATE_RECONNECTING;
++                } else if ("connected".equals(reported) && carrierReady) {
++                    state = STATE_CONNECTED;
++                }
++            }
++        } else if ("traffic".equals(type)) {
++            synchronized (lock) {
++                downlinkBytes += Math.max(0, object.optLong("down"));
++            }
++        } else if ("close".equals(type)) {
++            failCarrier("bridge closed the carrier");
++        }
++    }
++
++    private void onCarrierFrames(int carrierGeneration, byte[] value) {
++        if (value == null || value.length == 0) {
++            failCarrier("empty bridge message");
++            return;
++        }
++        java.util.List<WebProxyFrame> frames;
++        try {
++            frames = WebProxyFrame.parseAll(value);
++        } catch (WebProxyFrame.InvalidFrameException e) {
++            failCarrier(e.getMessage());
++            return;
++        }
++        for (int a = 0; a < frames.size(); a++) {
++            WebProxyFrame frame = frames.get(a);
++            if (frame.streamId == 0) {
++                if (frame.type == WebProxyFrame.TYPE_WELCOME) {
++                    boolean flushNow = false;
++                    synchronized (lock) {
++                        if (!running || generation != carrierGeneration || carrierReady) {
++                            continue;
++                        }
++                        carrierReady = true;
++                        state = STATE_CONNECTED;
++                        retryDelay = RETRY_MIN_DELAY;
++                        scheduleFlushLocked();
++                        flushNow = true;
++                    }
++                    if (flushNow && BuildVars.LOGS_ENABLED) {
++                        FileLog.d("web proxy: carrier session established");
++                    }
++                } else if (frame.type == WebProxyFrame.TYPE_PING) {
++                    enqueue(WebProxyFrame.pong(frame.payload));
++                } else if (frame.type == WebProxyFrame.TYPE_BYE) {
++                    failCarrier("relay closed the session");
++                    return;
++                }
++                continue;
++            }
++            Stream stream;
++            synchronized (lock) {
++                if (!running || generation != carrierGeneration) {
++                    return;
++                }
++                if (!carrierReady) {
++                    failCarrierLocked("stream frame before WELCOME");
++                    return;
++                }
++                stream = streams.get(frame.streamId);
++            }
++            if (stream == null) {
++                // A closed stream may still receive well formed late frames, drop them.
++                continue;
++            }
++            switch (frame.type) {
++                case WebProxyFrame.TYPE_DATA:
++                    stream.deliver(frame.payload);
++                    break;
++                case WebProxyFrame.TYPE_WINDOW:
++                    try {
++                        stream.grantCredit(frame.windowAmount());
++                    } catch (WebProxyFrame.InvalidFrameException e) {
++                        failCarrier(e.getMessage());
++                        return;
++                    }
++                    break;
++                case WebProxyFrame.TYPE_CLOSE:
++                    closeStream(frame.streamId, carrierGeneration, false);
++                    break;
++                default:
++                    break;
++            }
++        }
++    }
++
++    private static boolean equalsConstantTime(String expected, String value) {
++        if (expected == null || value == null || expected.length() != value.length()) {
++            return false;
++        }
++        int difference = 0;
++        for (int a = 0; a < expected.length(); a++) {
++            difference |= expected.charAt(a) ^ value.charAt(a);
++        }
++        return difference == 0;
++    }
++
++    private final class CarrierWebViewClient extends WebViewClient {
++
++        private final int carrierGeneration;
++        private final String allowedOrigin;
++        private final String canonicalUrl;
++
++        private CarrierWebViewClient(int carrierGeneration, String allowedOrigin, String canonicalUrl) {
++            this.carrierGeneration = carrierGeneration;
++            this.allowedOrigin = allowedOrigin;
++            this.canonicalUrl = canonicalUrl;
++        }
++
++        @Override
++        public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
++            // Only the one canonical nonce bearing bridge URL may become the main frame.
++            return !(request.isForMainFrame() && canonicalUrl.equals(request.getUrl().toString()));
++        }
++
++        @Override
++        public boolean shouldOverrideUrlLoading(WebView view, String url) {
++            return !canonicalUrl.equals(url);
++        }
++
++        @Override
++        public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
++            if (isAllowedRequest(request.getUrl())) {
++                return null;
++            }
++            return blockedResponse();
++        }
++
++        @Override
++        public WebResourceResponse shouldInterceptRequest(WebView view, String url) {
++            if (isAllowedRequest(Uri.parse(url))) {
++                return null;
++            }
++            return blockedResponse();
++        }
++
++        private boolean isAllowedRequest(Uri uri) {
++            if (uri == null) {
++                return false;
++            }
++            String scheme = uri.getScheme();
++            if (scheme == null) {
++                return false;
++            }
++            scheme = scheme.toLowerCase(Locale.US);
++            if (!"https".equals(scheme) && !"wss".equals(scheme)) {
++                return false;
++            }
++            if (uri.getUserInfo() != null) {
++                return false;
++            }
++            int port = uri.getPort();
++            if (port != -1 && port != 443) {
++                return false;
++            }
++            String host = uri.getHost();
++            return host != null && allowedOrigin.equals("https://" + host.toLowerCase(Locale.US));
++        }
++
++        private WebResourceResponse blockedResponse() {
++            Map<String, String> headers = Collections.emptyMap();
++            WebResourceResponse response = new WebResourceResponse("text/plain", "utf-8", new ByteArrayInputStream(new byte[0]));
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
++                response.setStatusCodeAndReasonPhrase(403, "Forbidden");
++                response.setResponseHeaders(headers);
++            }
++            return response;
++        }
++
++        @Override
++        public void onReceivedSslError(WebView view, SslErrorHandler handler, android.net.http.SslError error) {
++            handler.cancel();
++            failCarrier("tls error on the bridge origin");
++        }
++
++        @Override
++        public void onReceivedError(WebView view, WebResourceRequest request, android.webkit.WebResourceError error) {
++            if (request.isForMainFrame()) {
++                failCarrier("bridge document failed to load");
++            }
++        }
++
++        @Override
++        public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
++            synchronized (lock) {
++                if (webView != view) {
++                    return true;
++                }
++                webView = null;
++            }
++            try {
++                view.destroy();
++            } catch (Throwable ignore) {
++            }
++            failCarrier("webview renderer terminated");
++            return true;
++        }
++    }
++
++    private final class CarrierWebChromeClient extends WebChromeClient {
++
++        @Override
++        public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, android.os.Message resultMsg) {
++            return false;
++        }
++
++        @Override
++        public void onPermissionRequest(PermissionRequest request) {
++            request.deny();
++        }
++
++        @Override
++        public void onGeolocationPermissionsShowPrompt(String origin, GeolocationPermissions.Callback callback) {
++            callback.invoke(origin, false, false);
++        }
++
++        @Override
++        public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
++            callback.onReceiveValue(null);
++            return true;
++        }
++
++        @Override
++        public boolean onJsAlert(WebView view, String url, String message, android.webkit.JsResult result) {
++            result.cancel();
++            return true;
++        }
++
++        @Override
++        public boolean onJsConfirm(WebView view, String url, String message, android.webkit.JsResult result) {
++            result.cancel();
++            return true;
++        }
++
++        @Override
++        public boolean onJsPrompt(WebView view, String url, String message, String defaultValue, android.webkit.JsPromptResult result) {
++            result.cancel();
++            return true;
++        }
++
++        @Override
++        public boolean onConsoleMessage(ConsoleMessage message) {
++            return true;
++        }
++    }
++
++    // endregion
++
++    /**
++     * Runs before provider JavaScript. It installs a second CSP that does not depend on the
++     * response headers and replaces the browser facilities the bridge never uses with
++     * nonreplaceable unavailable shims. The CSP and the native policy remain the boundary.
++     */
++    private static String hardeningScript(String allowedOrigin) {
++        String csp = "default-src 'none'; base-uri 'none'; child-src 'none'; connect-src "
++                + allowedOrigin + " " + allowedOrigin.replaceFirst("^https:", "wss:")
++                + "; font-src 'none'; form-action 'none'; frame-src 'none'; img-src 'none';"
++                + " manifest-src 'none'; media-src 'none'; object-src 'none'; script-src 'unsafe-inline';"
++                + " style-src 'none'; worker-src 'none'";
++        return "(function(){'use strict';\n"
++                + "var root=document.documentElement;\n"
++                + "var head=document.head;\n"
++                + "if(!head){head=document.createElement('head');root.insertBefore(head,root.firstChild);}\n"
++                + "function meta(name,value,http){var node=document.createElement('meta');"
++                + "node.setAttribute(http?'http-equiv':'name',name);node.setAttribute('content',value);"
++                + "head.insertBefore(node,head.firstChild);}\n"
++                + "meta('x-dns-prefetch-control','off',true);\n"
++                + "meta('Content-Security-Policy'," + quote(csp) + ",true);\n"
++                + "function unavailable(){throw new Error('unavailable');}\n"
++                + "function deny(target,name,value){try{Object.defineProperty(target,name,"
++                + "{configurable:false,enumerable:false,writable:false,value:value});}catch(e){}}\n"
++                + "function denyGetter(target,name){try{Object.defineProperty(target,name,"
++                + "{configurable:false,enumerable:false,get:unavailable,set:function(){}});}catch(e){}}\n"
++                + "var storage=['localStorage','sessionStorage','indexedDB','caches','openDatabase',"
++                + "'webkitStorageInfo','webkitIndexedDB'];\n"
++                + "for(var a=0;a<storage.length;a++){denyGetter(window,storage[a]);}\n"
++                + "var constructors=['Worker','SharedWorker','BroadcastChannel','Audio','AudioContext',"
++                + "'webkitAudioContext','RTCPeerConnection','webkitRTCPeerConnection','SpeechSynthesisUtterance'];\n"
++                + "for(var b=0;b<constructors.length;b++){deny(window,constructors[b],unavailable);}\n"
++                + "deny(window,'open',function(){return null;});\n"
++                + "var inert=['print','alert','confirm','prompt'];\n"
++                + "for(var c=0;c<inert.length;c++){deny(window,inert[c],function(){});}\n"
++                + "var navigatorKeys=['serviceWorker','clipboard','mediaDevices','geolocation','bluetooth',"
++                + "'usb','serial','hid','credentials','storage','wakeLock','share','xr'];\n"
++                + "for(var d=0;d<navigatorKeys.length;d++){denyGetter(navigator,navigatorKeys[d]);}\n"
++                + "try{Object.defineProperty(document,'cookie',{configurable:false,enumerable:false,"
++                + "get:function(){return '';},set:function(){}});}catch(e){}\n"
++                + "})();";
++    }
++
++    private static String quote(String value) {
++        StringBuilder builder = new StringBuilder(value.length() + 2);
++        builder.append('\'');
++        for (int a = 0; a < value.length(); a++) {
++            char character = value.charAt(a);
++            if (character == '\'' || character == '\\') {
++                builder.append('\\');
++            }
++            builder.append(character);
++        }
++        builder.append('\'');
++        return builder.toString();
++    }
++}
+diff --git a/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java b/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java
+index f8383aef..8d86bc11 100644
+--- a/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java
++++ b/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java
+@@ -43,6 +43,7 @@ import org.telegram.messenger.SharedConfig;
+ import org.telegram.messenger.StatsController;
+ import org.telegram.messenger.UserConfig;
+ import org.telegram.messenger.Utilities;
++import org.telegram.messenger.WebProxyTransport;
+ import org.telegram.ui.Components.VideoPlayer;
+ import org.telegram.ui.LoginActivity;
+ 
+@@ -635,7 +636,12 @@ public class ConnectionsManager extends BaseController {
+         int proxyPort = preferences.getInt("proxy_port", 1080);
+ 
+         if (preferences.getBoolean("proxy_enabled", false) && !TextUtils.isEmpty(proxyAddress)) {
+-            native_setProxySettings(currentAccount, proxyAddress, proxyPort, proxyUsername, proxyPassword, proxySecret);
++            int webProxyPort = webProxyPort(proxyAddress, proxyPort, proxySecret);
++            if (webProxyPort != 0) {
++                native_setProxySettings(currentAccount, WebProxyTransport.LOOPBACK_ADDRESS, webProxyPort, "", "", proxySecret);
++            } else {
++                native_setProxySettings(currentAccount, proxyAddress, proxyPort, proxyUsername, proxyPassword, proxySecret);
++            }
+         }
+         String installer = "";
+         try {
+@@ -939,6 +945,24 @@ public class ConnectionsManager extends BaseController {
+         KeepAliveJob.startJob();
+     }
+ 
++    /**
++     * A WEB proxy is carried by the private WebView sidecar: native tgnet keeps performing the
++     * user's MTProxy transform but connects to the loopback listener instead of the relay. Returns
++     * 0 when the entry is an ordinary SOCKS5 or MTProto proxy, and an unusable loopback port when
++     * the carrier cannot run, so that a WEB proxy never falls back to a direct connection.
++     */
++    private static int webProxyPort(String address, int port, String secret) {
++        if (!SharedConfig.isWebProxy(address, port, secret)) {
++            return 0;
++        }
++        int localPort = WebProxyTransport.getInstance().start(address, secret);
++        if (localPort == 0) {
++            FileLog.e("web proxy: the carrier could not be started");
++            return WebProxyTransport.UNUSABLE_PORT;
++        }
++        return localPort;
++    }
++
+     public static void setProxySettings(boolean enabled, String address, int port, String username, String password, String secret) {
+         if (address == null) {
+             address = "";
+@@ -953,6 +977,20 @@ public class ConnectionsManager extends BaseController {
+             secret = "";
+         }
+ 
++        if (enabled && !TextUtils.isEmpty(address)) {
++            int webProxyPort = webProxyPort(address, port, secret);
++            if (webProxyPort != 0) {
++                address = WebProxyTransport.LOOPBACK_ADDRESS;
++                port = webProxyPort;
++                username = "";
++                password = "";
++            } else {
++                WebProxyTransport.getInstance().stop();
++            }
++        } else {
++            WebProxyTransport.getInstance().stop();
++        }
++
+         for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
+             if (enabled && !TextUtils.isEmpty(address)) {
+                 native_setProxySettings(a, address, port, username, password, secret);
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ProxyListActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ProxyListActivity.java
+index be4d12cc..e930ac89 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/ProxyListActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/ProxyListActivity.java
+@@ -175,7 +175,8 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
+         }
+ 
+         public void setProxy(SharedConfig.ProxyInfo proxyInfo) {
+-            textView.setText(proxyInfo.address + ":" + proxyInfo.port);
++            // A WEB proxy is always HTTPS on 443, the port is not part of its identity.
++            textView.setText(proxyInfo.isWeb() ? proxyInfo.address : proxyInfo.address + ":" + proxyInfo.port);
+             currentInfo = proxyInfo;
+         }
+ 
+@@ -196,6 +197,11 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
+                     colorKey = Theme.key_windowBackgroundWhiteGrayText2;
+                     valueTextView.setText(getString(R.string.Connecting));
+                 }
++            } else if (currentInfo.isWeb()) {
++                // Checking one would activate the process wide WebView carrier, so WEB entries
++                // learn their real state only after the user activates them.
++                valueTextView.setText(getString(R.string.ProxyNotTested));
++                colorKey = Theme.key_windowBackgroundWhiteGrayText2;
+             } else {
+                 if (currentInfo.checking) {
+                     valueTextView.setText(getString(R.string.Checking));
+@@ -722,7 +728,7 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
+     private void checkProxyList() {
+         for (int a = 0, count = proxyList.size(); a < count; a++) {
+             final SharedConfig.ProxyInfo proxyInfo = proxyList.get(a);
+-            if (proxyInfo.checking || SystemClock.elapsedRealtime() - proxyInfo.availableCheckTime < 2 * 60 * 1000) {
++            if (proxyInfo.isWeb() || proxyInfo.checking || SystemClock.elapsedRealtime() - proxyInfo.availableCheckTime < 2 * 60 * 1000) {
+                 continue;
+             }
+             proxyInfo.checking = true;
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ProxySettingsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ProxySettingsActivity.java
+index 5e5e6934..6263fd37 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/ProxySettingsActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/ProxySettingsActivity.java
+@@ -51,6 +51,7 @@ import org.telegram.messenger.R;
+ import org.telegram.messenger.SharedConfig;
+ import org.telegram.messenger.SvgHelper;
+ import org.telegram.messenger.Utilities;
++import org.telegram.messenger.WebProxyLink;
+ import org.telegram.tgnet.ConnectionsManager;
+ import org.telegram.ui.ActionBar.ActionBar;
+ import org.telegram.ui.ActionBar.ActionBarMenuItem;
+@@ -77,6 +78,7 @@ public class ProxySettingsActivity extends BaseFragment {
+ 
+     private final static int TYPE_SOCKS5 = 0;
+     private final static int TYPE_MTPROTO = 1;
++    private final static int TYPE_WEB = 2;
+ 
+     private final static int FIELD_IP = 0;
+     private final static int FIELD_PORT = 1;
+@@ -90,11 +92,11 @@ public class ProxySettingsActivity extends BaseFragment {
+     private LinearLayout inputFieldsContainer;
+     private HeaderCell headerCell;
+     private ShadowSectionCell[] sectionCell = new ShadowSectionCell[3];
+-    private TextInfoPrivacyCell[] bottomCells = new TextInfoPrivacyCell[2];
++    private TextInfoPrivacyCell[] bottomCells = new TextInfoPrivacyCell[3];
+     private TextSettingsCell shareCell;
+     private TextSettingsCell pasteCell;
+     private ActionBarMenuItem doneItem;
+-    private RadioCell[] typeCell = new RadioCell[2];
++    private RadioCell[] typeCell = new RadioCell[3];
+     private int currentType = -1;
+ 
+     private int pasteType = -1;
+@@ -211,16 +213,33 @@ public class ProxySettingsActivity extends BaseFragment {
+                     if (getParentActivity() == null) {
+                         return;
+                     }
+-                    currentProxyInfo.address = inputFields[FIELD_IP].getText().toString();
+-                    currentProxyInfo.port = Utilities.parseInt(inputFields[FIELD_PORT].getText().toString());
+-                    if (currentType == 0) {
+-                        currentProxyInfo.secret = "";
+-                        currentProxyInfo.username = inputFields[FIELD_USER].getText().toString();
+-                        currentProxyInfo.password = inputFields[FIELD_PASSWORD].getText().toString();
+-                    } else {
+-                        currentProxyInfo.secret = inputFields[FIELD_SECRET].getText().toString();
++                    WebProxyLink webLink = currentType == TYPE_WEB
++                            ? WebProxyLink.from(inputFields[FIELD_IP].getText().toString(), inputFields[FIELD_SECRET].getText().toString())
++                            : null;
++                    if (currentType == TYPE_WEB && webLink == null) {
++                        AndroidUtilities.shakeView(inputFields[WebProxyLink.isValidSecret(inputFields[FIELD_SECRET].getText().toString()) ? FIELD_IP : FIELD_SECRET]);
++                        return;
++                    }
++                    currentProxyInfo.type = currentType;
++                    if (currentType == TYPE_WEB) {
++                        // WEB always uses HTTPS on 443 and has no username or password.
++                        currentProxyInfo.address = webLink.hostname;
++                        currentProxyInfo.port = WebProxyLink.PORT;
++                        currentProxyInfo.secret = webLink.secret;
+                         currentProxyInfo.username = "";
+                         currentProxyInfo.password = "";
++                    } else {
++                        currentProxyInfo.address = inputFields[FIELD_IP].getText().toString();
++                        currentProxyInfo.port = Utilities.parseInt(inputFields[FIELD_PORT].getText().toString());
++                        if (currentType == TYPE_SOCKS5) {
++                            currentProxyInfo.secret = "";
++                            currentProxyInfo.username = inputFields[FIELD_USER].getText().toString();
++                            currentProxyInfo.password = inputFields[FIELD_PASSWORD].getText().toString();
++                        } else {
++                            currentProxyInfo.secret = inputFields[FIELD_SECRET].getText().toString();
++                            currentProxyInfo.username = "";
++                            currentProxyInfo.password = "";
++                        }
+                     }
+ 
+                     SharedPreferences preferences = MessagesController.getGlobalMainSettings();
+@@ -272,14 +291,16 @@ public class ProxySettingsActivity extends BaseFragment {
+ 
+         final View.OnClickListener typeCellClickListener = view -> setProxyType((Integer) view.getTag(), true);
+ 
+-        for (int a = 0; a < 2; a++) {
++        for (int a = 0; a < 3; a++) {
+             typeCell[a] = new RadioCell(context);
+             typeCell[a].setBackground(Theme.getSelectorDrawable(true));
+             typeCell[a].setTag(a);
+-            if (a == 0) {
++            if (a == TYPE_SOCKS5) {
+                 typeCell[a].setText(LocaleController.getString(R.string.UseProxySocks5), a == currentType, true);
++            } else if (a == TYPE_MTPROTO) {
++                typeCell[a].setText(LocaleController.getString(R.string.UseProxyTelegram), a == currentType, true);
+             } else {
+-                typeCell[a].setText(LocaleController.getString(R.string.UseProxyTelegram), a == currentType, false);
++                typeCell[a].setText(LocaleController.getString(R.string.UseProxyWeb), a == currentType, false);
+             }
+             linearLayout2.addView(typeCell[a], LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 50));
+             typeCell[a].setOnClickListener(typeCellClickListener);
+@@ -391,6 +412,24 @@ public class ProxySettingsActivity extends BaseFragment {
+                 inputFields[a].setTransformationMethod(PasswordTransformationMethod.getInstance());
+             } else {
+                 inputFields[a].setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
++                if (a == FIELD_SECRET) {
++                    inputFields[a].addTextChangedListener(new TextWatcher() {
++                        @Override
++                        public void beforeTextChanged(CharSequence s, int start, int count, int after) {
++
++                        }
++
++                        @Override
++                        public void onTextChanged(CharSequence s, int start, int before, int count) {
++
++                        }
++
++                        @Override
++                        public void afterTextChanged(Editable s) {
++                            checkShareDone(true);
++                        }
++                    });
++                }
+             }
+             inputFields[a].setImeOptions(EditorInfo.IME_ACTION_NEXT | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
+             switch (a) {
+@@ -436,13 +475,20 @@ public class ProxySettingsActivity extends BaseFragment {
+             });
+         }
+ 
+-        for (int i = 0; i < 2; i++) {
++        for (int i = 0; i < 3; i++) {
+             bottomCells[i] = new TextInfoPrivacyCell(context);
+             bottomCells[i].setBackground(Theme.getThemedDrawableByKey(context, R.drawable.greydivider_bottom, Theme.key_windowBackgroundGrayShadow));
+             if (i == 0) {
+                 bottomCells[i].setText(LocaleController.getString(R.string.UseProxyInfo));
++            } else if (i == 1) {
++                bottomCells[i].setText(LocaleController.getString(R.string.UseProxyTelegramInfo) + "
++
++" + LocaleController.getString(R.string.UseProxyTelegramInfo2));
++                bottomCells[i].setVisibility(View.GONE);
+             } else {
+-                bottomCells[i].setText(LocaleController.getString(R.string.UseProxyTelegramInfo) + "\n\n" + LocaleController.getString(R.string.UseProxyTelegramInfo2));
++                bottomCells[i].setText(LocaleController.getString(R.string.UseProxyWebInfo) + "
++
++" + LocaleController.getString(R.string.UseProxyTelegramInfo2));
+                 bottomCells[i].setVisibility(View.GONE);
+             }
+             linearLayout2.addView(bottomCells[i], LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+@@ -458,7 +504,10 @@ public class ProxySettingsActivity extends BaseFragment {
+                     if (pasteType == TYPE_SOCKS5 && i == FIELD_SECRET) {
+                         continue;
+                     }
+-                    if (pasteType == TYPE_MTPROTO && (i == FIELD_USER || i == FIELD_PASSWORD)) {
++                    if ((pasteType == TYPE_MTPROTO || pasteType == TYPE_WEB) && (i == FIELD_USER || i == FIELD_PASSWORD)) {
++                        continue;
++                    }
++                    if (pasteType == TYPE_WEB && i == FIELD_PORT) {
+                         continue;
+                     }
+                     if (pasteFields[i] != null) {
+@@ -478,7 +527,7 @@ public class ProxySettingsActivity extends BaseFragment {
+                         if (pasteType == TYPE_SOCKS5 && i != FIELD_SECRET) {
+                             continue;
+                         }
+-                        if (pasteType == TYPE_MTPROTO && i != FIELD_USER && i != FIELD_PASSWORD) {
++                        if ((pasteType == TYPE_MTPROTO || pasteType == TYPE_WEB) && i != FIELD_USER && i != FIELD_PASSWORD) {
+                             continue;
+                         }
+                         inputFields[i].setText(null);
+@@ -499,6 +548,18 @@ public class ProxySettingsActivity extends BaseFragment {
+         shareCell.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText4));
+         linearLayout2.addView(shareCell, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+         shareCell.setOnClickListener(v -> {
++            if (currentType == TYPE_WEB) {
++                if (!isValidWebProxy()) {
++                    return;
++                }
++                WebProxyLink parsed = WebProxyLink.from(inputFields[FIELD_IP].getText().toString(), inputFields[FIELD_SECRET].getText().toString());
++                String webLink = WebProxyLink.buildLink(parsed.hostname, parsed.secret);
++                QRCodeBottomSheet webAlert = new QRCodeBottomSheet(context, LocaleController.getString(R.string.ShareQrCode), webLink, LocaleController.getString(R.string.QRCodeLinkHelpProxy), true);
++                Bitmap webIcon = SvgHelper.getBitmap(AndroidUtilities.readRes(R.raw.qr_dog), AndroidUtilities.dp(60), AndroidUtilities.dp(60), false);
++                webAlert.setCenterImage(webIcon);
++                showDialog(webAlert);
++                return;
++            }
+             StringBuilder params = new StringBuilder();
+             String address = inputFields[FIELD_IP].getText().toString();
+             String password = inputFields[FIELD_PASSWORD].getText().toString();
+@@ -561,7 +622,7 @@ public class ProxySettingsActivity extends BaseFragment {
+         checkShareDone(false);
+ 
+         currentType = -1;
+-        setProxyType(TextUtils.isEmpty(currentProxyInfo.secret) ? 0 : 1, false);
++        setProxyType(currentProxyInfo.type, false);
+ 
+         pasteType = -1;
+         pasteString = null;
+@@ -604,6 +665,18 @@ public class ProxySettingsActivity extends BaseFragment {
+                 }
+             }
+ 
++            if (params == null) {
++                final String[] webStrings = {"t.me/webproxy?", "tg://webproxy?"};
++                for (int i = 0; i < webStrings.length; i++) {
++                    final int index = clipText.indexOf(webStrings[i]);
++                    if (index >= 0) {
++                        pasteType = TYPE_WEB;
++                        params = clipText.substring(index + webStrings[i].length()).split("&");
++                        break;
++                    }
++                }
++            }
++
+             if (params == null) {
+                 final String[] proxyStrings = {"t.me/proxy?", "tg://proxy?"};
+                 for (int i = 0; i < proxyStrings.length; i++) {
+@@ -624,6 +697,11 @@ public class ProxySettingsActivity extends BaseFragment {
+                         case "server":
+                             pasteFields[FIELD_IP] = pair[1];
+                             break;
++                        case "host":
++                            if (pasteType == TYPE_WEB && pasteFields[FIELD_IP] == null) {
++                                pasteFields[FIELD_IP] = pair[1];
++                            }
++                            break;
+                         case "port":
+                             pasteFields[FIELD_PORT] = pair[1];
+                             break;
+@@ -638,7 +716,7 @@ public class ProxySettingsActivity extends BaseFragment {
+                             }
+                             break;
+                         case "secret":
+-                            if (pasteType == TYPE_MTPROTO) {
++                            if (pasteType == TYPE_MTPROTO || pasteType == TYPE_WEB) {
+                                 pasteFields[FIELD_SECRET] = pair[1];
+                             }
+                             break;
+@@ -692,9 +770,17 @@ public class ProxySettingsActivity extends BaseFragment {
+         if (shareCell == null || doneItem == null || inputFields[FIELD_IP] == null || inputFields[FIELD_PORT] == null) {
+             return;
+         }
++        if (currentType == TYPE_WEB) {
++            setShareDoneEnabled(isValidWebProxy(), animated);
++            return;
++        }
+         setShareDoneEnabled(inputFields[FIELD_IP].length() != 0 && Utilities.parseInt(inputFields[FIELD_PORT].getText().toString()) != 0, animated);
+     }
+ 
++    private boolean isValidWebProxy() {
++        return WebProxyLink.from(inputFields[FIELD_IP].getText().toString(), inputFields[FIELD_SECRET].getText().toString()) != null;
++    }
++
+     private void setProxyType(int type, boolean animated) {
+         setProxyType(type, animated, null);
+     }
+@@ -740,21 +826,39 @@ public class ProxySettingsActivity extends BaseFragment {
+ 
+                 TransitionManager.beginDelayedTransition(linearLayout2, transitionSet);
+             }
+-            if (currentType == 0) {
++            if (currentType == TYPE_SOCKS5) {
+                 bottomCells[0].setVisibility(View.VISIBLE);
+                 bottomCells[1].setVisibility(View.GONE);
++                bottomCells[2].setVisibility(View.GONE);
++                ((View) inputFields[FIELD_PORT].getParent()).setVisibility(View.VISIBLE);
+                 ((View) inputFields[FIELD_SECRET].getParent()).setVisibility(View.GONE);
+                 ((View) inputFields[FIELD_PASSWORD].getParent()).setVisibility(View.VISIBLE);
+                 ((View) inputFields[FIELD_USER].getParent()).setVisibility(View.VISIBLE);
+-            } else if (currentType == 1) {
++            } else if (currentType == TYPE_MTPROTO) {
+                 bottomCells[0].setVisibility(View.GONE);
+                 bottomCells[1].setVisibility(View.VISIBLE);
++                bottomCells[2].setVisibility(View.GONE);
++                ((View) inputFields[FIELD_PORT].getParent()).setVisibility(View.VISIBLE);
++                ((View) inputFields[FIELD_SECRET].getParent()).setVisibility(View.VISIBLE);
++                ((View) inputFields[FIELD_PASSWORD].getParent()).setVisibility(View.GONE);
++                ((View) inputFields[FIELD_USER].getParent()).setVisibility(View.GONE);
++            } else if (currentType == TYPE_WEB) {
++                // WEB is always HTTPS on 443, so the port is fixed and hidden.
++                bottomCells[0].setVisibility(View.GONE);
++                bottomCells[1].setVisibility(View.GONE);
++                bottomCells[2].setVisibility(View.VISIBLE);
++                ignoreOnTextChange = true;
++                inputFields[FIELD_PORT].setText("" + WebProxyLink.PORT);
++                ignoreOnTextChange = false;
++                ((View) inputFields[FIELD_PORT].getParent()).setVisibility(View.GONE);
+                 ((View) inputFields[FIELD_SECRET].getParent()).setVisibility(View.VISIBLE);
+                 ((View) inputFields[FIELD_PASSWORD].getParent()).setVisibility(View.GONE);
+                 ((View) inputFields[FIELD_USER].getParent()).setVisibility(View.GONE);
+             }
+-            typeCell[0].setChecked(currentType == 0, animated);
+-            typeCell[1].setChecked(currentType == 1, animated);
++            typeCell[0].setChecked(currentType == TYPE_SOCKS5, animated);
++            typeCell[1].setChecked(currentType == TYPE_MTPROTO, animated);
++            typeCell[2].setChecked(currentType == TYPE_WEB, animated);
++            checkShareDone(animated);
+         }
+     }
+ 
+diff --git a/TMessagesProj/src/main/res/values/strings.xml b/TMessagesProj/src/main/res/values/strings.xml
+index ffa4d566..cdeb8973 100644
+--- a/TMessagesProj/src/main/res/values/strings.xml
++++ b/TMessagesProj/src/main/res/values/strings.xml
+@@ -2692,6 +2692,9 @@
+     <string name="UseProxySponsorInfo">This channel is shown by your proxy server. To remove this channel from your chat list, disable the proxy in Telegram Settings.</string>
+     <string name="UseProxyInfo">SOCKS5 proxy settings.</string>
+     <string name="UseProxyTelegramInfo">MTProto proxy settings.</string>
++    <string name="UseProxyWeb">WEB Proxy</string>
++    <string name="UseProxyWebInfo">WEB proxy settings. The connection is carried by a private, hidden web page while Telegram is open.</string>
++    <string name="ProxyNotTested">Not tested</string>
+     <string name="UseProxyTelegramInfo2">This proxy may display a sponsored channel in your chat list. This doesn\'t reveal any of your Telegram traffic.</string>
+     <string name="UseProxyForCalls">Use proxy for calls</string>
+     <string name="UseProxyForCallsInfo">Proxy servers may degrade the quality of your calls.</string>

@@ -1,9 +1,14 @@
 # Android WEB proxy proof of concept
 
 This document maps the WEB proxy carrier onto the official Telegram Android
-source at `../Other/Telegram-Android`. The proof of concept deliberately reuses
+source. The proof of concept deliberately reuses
 Android tgnet's existing MTProxy transform and implements the shared, client-neutral
 relay protocol in `PROTOCOL.md`.
+
+The reference implementation of everything below lives in `android/`:
+`android/telegram-web-proxy.patch` applies to the pinned upstream release,
+`android/build.sh` produces the APK, and `android/jvmtest/run.sh` runs the client
+checks against a live relay.
 
 ## Chosen architecture
 
@@ -177,8 +182,13 @@ implemented by the server-provided page and does not change the Android boundary
 The proof of concept touches these areas in the cloned upstream source:
 
 - `TMessagesProj/src/main/java/org/telegram/messenger/WebProxyTransport.java`
-  owns the loopback listener, stream mux, hidden WebView, capability derivation,
-  origin checks, and reconnect lifecycle.
+  owns the loopback listener, stream mux, hidden WebView, origin checks, and the
+  reconnect lifecycle.
+- `WebProxyFrame.java` is the shared-frame codec: encoding, batch parsing, and the
+  relay-to-client shape validation.
+- `WebProxyLink.java` owns canonical hostname and secret validation, the bridge
+  capability derivation, the bridge URL, and `t.me/webproxy` link parsing and
+  formatting.
 - `SharedConfig.ProxyInfo` has an explicit SOCKS5 / MTProto / WEB type. Proxy-list
   schema v3 appends the type after the v2 record fields, while v2 and legacy lists
   retain their inferred types.
@@ -190,6 +200,9 @@ The proof of concept touches these areas in the cloned upstream source:
 - `ProxyListActivity` stores and displays the explicit type. Availability checks and
   automatic rotation skip WEB entries because checking one would activate a
   process-wide WebView carrier.
+- `AndroidUtilities` recognizes the WEB proxy link before the SOCKS5 and MTProto
+  forms and shows the shared confirmation sheet with the WEB type; `ProxyRotationController`
+  never rotates into a WEB entry.
 - `androidx.webkit:webkit:1.14.0` provides the exact-origin binary message API.
 
 ## Proxy links
@@ -221,26 +234,34 @@ A production-wide HTTPS link requires Telegram to register the route on `t.me`.
 
 ## Build
 
-The upstream checkout requires its three shallow submodules plus JDK 17, Android
-SDK/platform 35, build-tools 35.0.0, NDK 27.2.12479018, and CMake 3.10.2. On this
-Mac the SDK root is `/opt/homebrew/share/android-commandlinetools` and the JDK is
-`/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home`.
+`android/build.sh` clones the pinned upstream release with its shallow submodules,
+applies `android/telegram-web-proxy.patch` and runs the ordinary Gradle build:
+
+```bash
+JAVA_HOME=/path/to/jdk-17 ANDROID_SDK_ROOT=/path/to/android-sdk ./android/build.sh
+```
+
+The toolchain the upstream release expects is JDK 17, Android platform 35 and 36,
+build-tools 36.0.0, NDK 27.2.12479018 and CMake 3.22.1, plus roughly 25 GB of free
+disk space. The equivalent manual invocation inside a patched checkout is:
 
 ```bash
 git submodule update --init --recursive --depth=1
-
-JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home \
-ANDROID_HOME=/opt/homebrew/share/android-commandlinetools \
-ANDROID_SDK_ROOT=/opt/homebrew/share/android-commandlinetools \
 ./gradlew :TMessagesProj_App:assembleAfatDebug
 ```
 
 The expected APK is
-`TMessagesProj_App/build/outputs/apk/afat/debug/app.apk`. The upstream repository
+`TMessagesProj_App/build/outputs/apk/afat/debug/app.apk`, with `armeabi-v7a`,
+`arm64-v8a`, `x86` and `x86_64` native libraries. The upstream repository
 contains dummy reproducible-build credentials; the result is for local testing,
 not publication.
 
 ## Test sequence
+
+`android/jvmtest/run.sh` runs first and needs no device: it checks the frame codec,
+hostname, secret, capability and link vectors, then runs the real `WebProxyTransport`
+on the JVM against a Java stand-in for the bridge page, a live `tproxy-server` and an
+echoing backend. Then, on a device:
 
 1. Deploy the updated relay and confirm an existing WEB client still connects.
 2. Install the debug APK and ensure Android System WebView is current.
