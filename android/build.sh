@@ -40,6 +40,18 @@ fi
 
 printf 'sdk.dir=%s\n' "$sdk_root" > "$checkout/local.properties"
 
+# Telegram refuses to sign a real account in with the placeholder api_id the upstream
+# repository ships. Get your own from https://my.telegram.org, API development tools.
+build_vars=$checkout/TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java
+if [ -n "${TELEGRAM_APP_ID:-}" ] && [ -n "${TELEGRAM_APP_HASH:-}" ]; then
+    sed -i -E "s/public static int APP_ID = .*/public static int APP_ID = ${TELEGRAM_APP_ID};/" "$build_vars"
+    sed -i -E "s/public static String APP_HASH = .*/public static String APP_HASH = \"${TELEGRAM_APP_HASH}\";/" "$build_vars"
+    echo "building with the supplied Telegram api_id"
+elif grep -q 'APP_ID = 4;' "$build_vars"; then
+    echo "warning: building with the upstream placeholder api_id, sign in will fail." >&2
+    echo "         set TELEGRAM_APP_ID and TELEGRAM_APP_HASH to your own credentials." >&2
+fi
+
 (cd "$checkout" && ANDROID_SDK_ROOT="$sdk_root" ANDROID_HOME="$sdk_root" ./gradlew --no-daemon "$GRADLE_TASK")
 
 echo

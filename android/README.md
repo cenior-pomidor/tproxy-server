@@ -47,6 +47,31 @@ build compiles the native tree for four ABIs and takes a while; later builds reu
 The pinned tree builds to `org.telegram.messenger.beta` 12.10.1, minSdk 21,
 targetSdk 36, an APK of about 113 MB carrying all four `libtmessages.49.so` variants.
 
+## Signing in
+
+The upstream repository ships a placeholder `api_id` (`BuildVars.APP_ID = 4`), and Telegram
+refuses to send a login code for it. Get your own pair from
+[my.telegram.org](https://my.telegram.org), API development tools, and pass it to the build:
+
+```bash
+TELEGRAM_APP_ID=1234567 TELEGRAM_APP_HASH=0123456789abcdef0123456789abcdef \
+JAVA_HOME=/path/to/jdk-17 ANDROID_SDK_ROOT=/path/to/android-sdk ./android/build.sh
+```
+
+The APK signature has no part in signing in: MTProto never sees it. A non-Google signature
+only costs the Play Integrity check that auto-fills an SMS code, and the client falls back to
+an ordinary code. To sign the APK with your own key anyway, no rebuild is needed:
+
+```bash
+apksigner sign --ks my.keystore --ks-key-alias mykey --out telegram-webproxy-signed.apk app.apk
+```
+
+Uninstall the previously installed build first: Android refuses to replace an APK whose
+signing key changed.
+
+Configure the proxy before signing in when the network blocks Telegram: the login screen shows
+a proxy button once the connection stalls, and it opens the same proxy list as the settings.
+
 ## Checks
 
 ```bash
