@@ -55,7 +55,9 @@ capability and link vectors from `PROTOCOL.md`. `BridgeHarness` compiles the rea
 `WebProxyTransport` against small Android and AndroidX stubs, plays the bridge page
 with a plain Java implementation of the `https` carrier, and drives a live
 `tproxy-server` whose backend echoes bytes: it checks session setup, small and 9 MiB
-round trips, concurrent streams, backend-initiated close and shutdown.
+round trips, concurrent streams, backend-initiated close, carrier failure and
+reconnect, and that a system WebView without the exact-origin binary message
+boundary carries no traffic at all.
 
 ## Using it
 
