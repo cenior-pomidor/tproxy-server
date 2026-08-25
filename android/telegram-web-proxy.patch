@@ -1988,7 +1988,7 @@ index be4d12cc..e930ac89 100644
              }
              proxyInfo.checking = true;
 diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ProxySettingsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ProxySettingsActivity.java
-index 5e5e6934..6263fd37 100644
+index 5e5e6934..24a042f0 100644
 --- a/TMessagesProj/src/main/java/org/telegram/ui/ProxySettingsActivity.java
 +++ b/TMessagesProj/src/main/java/org/telegram/ui/ProxySettingsActivity.java
 @@ -51,6 +51,7 @@ import org.telegram.messenger.R;
@@ -2108,7 +2108,7 @@ index 5e5e6934..6263fd37 100644
              }
              inputFields[a].setImeOptions(EditorInfo.IME_ACTION_NEXT | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
              switch (a) {
-@@ -436,13 +475,20 @@ public class ProxySettingsActivity extends BaseFragment {
+@@ -436,14 +475,17 @@ public class ProxySettingsActivity extends BaseFragment {
              });
          }
  
@@ -2118,20 +2118,17 @@ index 5e5e6934..6263fd37 100644
              bottomCells[i].setBackground(Theme.getThemedDrawableByKey(context, R.drawable.greydivider_bottom, Theme.key_windowBackgroundGrayShadow));
              if (i == 0) {
                  bottomCells[i].setText(LocaleController.getString(R.string.UseProxyInfo));
+-            } else {
 +            } else if (i == 1) {
-+                bottomCells[i].setText(LocaleController.getString(R.string.UseProxyTelegramInfo) + "
-+
-+" + LocaleController.getString(R.string.UseProxyTelegramInfo2));
-+                bottomCells[i].setVisibility(View.GONE);
-             } else {
--                bottomCells[i].setText(LocaleController.getString(R.string.UseProxyTelegramInfo) + "\n\n" + LocaleController.getString(R.string.UseProxyTelegramInfo2));
-+                bottomCells[i].setText(LocaleController.getString(R.string.UseProxyWebInfo) + "
-+
-+" + LocaleController.getString(R.string.UseProxyTelegramInfo2));
+                 bottomCells[i].setText(LocaleController.getString(R.string.UseProxyTelegramInfo) + "\n\n" + LocaleController.getString(R.string.UseProxyTelegramInfo2));
                  bottomCells[i].setVisibility(View.GONE);
++            } else {
++                bottomCells[i].setText(LocaleController.getString(R.string.UseProxyWebInfo) + "\n\n" + LocaleController.getString(R.string.UseProxyTelegramInfo2));
++                bottomCells[i].setVisibility(View.GONE);
              }
              linearLayout2.addView(bottomCells[i], LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
-@@ -458,7 +504,10 @@ public class ProxySettingsActivity extends BaseFragment {
+         }
+@@ -458,7 +500,10 @@ public class ProxySettingsActivity extends BaseFragment {
                      if (pasteType == TYPE_SOCKS5 && i == FIELD_SECRET) {
                          continue;
                      }
@@ -2143,7 +2140,7 @@ index 5e5e6934..6263fd37 100644
                          continue;
                      }
                      if (pasteFields[i] != null) {
-@@ -478,7 +527,7 @@ public class ProxySettingsActivity extends BaseFragment {
+@@ -478,7 +523,7 @@ public class ProxySettingsActivity extends BaseFragment {
                          if (pasteType == TYPE_SOCKS5 && i != FIELD_SECRET) {
                              continue;
                          }
@@ -2152,7 +2149,7 @@ index 5e5e6934..6263fd37 100644
                              continue;
                          }
                          inputFields[i].setText(null);
-@@ -499,6 +548,18 @@ public class ProxySettingsActivity extends BaseFragment {
+@@ -499,6 +544,18 @@ public class ProxySettingsActivity extends BaseFragment {
          shareCell.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText4));
          linearLayout2.addView(shareCell, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
          shareCell.setOnClickListener(v -> {
@@ -2171,7 +2168,7 @@ index 5e5e6934..6263fd37 100644
              StringBuilder params = new StringBuilder();
              String address = inputFields[FIELD_IP].getText().toString();
              String password = inputFields[FIELD_PASSWORD].getText().toString();
-@@ -561,7 +622,7 @@ public class ProxySettingsActivity extends BaseFragment {
+@@ -561,7 +618,7 @@ public class ProxySettingsActivity extends BaseFragment {
          checkShareDone(false);
  
          currentType = -1;
@@ -2180,7 +2177,7 @@ index 5e5e6934..6263fd37 100644
  
          pasteType = -1;
          pasteString = null;
-@@ -604,6 +665,18 @@ public class ProxySettingsActivity extends BaseFragment {
+@@ -604,6 +661,18 @@ public class ProxySettingsActivity extends BaseFragment {
                  }
              }
  
@@ -2199,7 +2196,7 @@ index 5e5e6934..6263fd37 100644
              if (params == null) {
                  final String[] proxyStrings = {"t.me/proxy?", "tg://proxy?"};
                  for (int i = 0; i < proxyStrings.length; i++) {
-@@ -624,6 +697,11 @@ public class ProxySettingsActivity extends BaseFragment {
+@@ -624,6 +693,11 @@ public class ProxySettingsActivity extends BaseFragment {
                          case "server":
                              pasteFields[FIELD_IP] = pair[1];
                              break;
@@ -2211,7 +2208,7 @@ index 5e5e6934..6263fd37 100644
                          case "port":
                              pasteFields[FIELD_PORT] = pair[1];
                              break;
-@@ -638,7 +716,7 @@ public class ProxySettingsActivity extends BaseFragment {
+@@ -638,7 +712,7 @@ public class ProxySettingsActivity extends BaseFragment {
                              }
                              break;
                          case "secret":
@@ -2220,7 +2217,7 @@ index 5e5e6934..6263fd37 100644
                                  pasteFields[FIELD_SECRET] = pair[1];
                              }
                              break;
-@@ -692,9 +770,17 @@ public class ProxySettingsActivity extends BaseFragment {
+@@ -692,9 +766,17 @@ public class ProxySettingsActivity extends BaseFragment {
          if (shareCell == null || doneItem == null || inputFields[FIELD_IP] == null || inputFields[FIELD_PORT] == null) {
              return;
          }
@@ -2238,7 +2235,7 @@ index 5e5e6934..6263fd37 100644
      private void setProxyType(int type, boolean animated) {
          setProxyType(type, animated, null);
      }
-@@ -740,21 +826,39 @@ public class ProxySettingsActivity extends BaseFragment {
+@@ -740,21 +822,39 @@ public class ProxySettingsActivity extends BaseFragment {
  
                  TransitionManager.beginDelayedTransition(linearLayout2, transitionSet);
              }
