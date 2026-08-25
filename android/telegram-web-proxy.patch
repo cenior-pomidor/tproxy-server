@@ -704,10 +704,10 @@ index 00000000..c9ce3aee
 +}
 diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/WebProxyTransport.java b/TMessagesProj/src/main/java/org/telegram/messenger/WebProxyTransport.java
 new file mode 100644
-index 00000000..a5f76569
+index 00000000..a2fb1f9d
 --- /dev/null
 +++ b/TMessagesProj/src/main/java/org/telegram/messenger/WebProxyTransport.java
-@@ -0,0 +1,1170 @@
+@@ -0,0 +1,1172 @@
 +/*
 + * This is the source code of Telegram for Android v. 5.x.x.
 + * It is licensed under GNU GPL v. 2 or later.
@@ -784,7 +784,9 @@ index 00000000..a5f76569
 +    private static final String JS_OBJECT_NAME = "TelegramWebProxy";
 +    private static final String INIT_MESSAGE = "tproxy-android-init";
 +
-+    private static final int MAX_STREAMS = 64;
++    // The relay refuses an OPEN beyond its own per session limit with a CLOSE for that id,
++    // this bound only keeps a broken carrier from accumulating local sockets.
++    private static final int MAX_STREAMS = 128;
 +    private static final int CARRIER_MESSAGE_BYTES = 256 * 1024;
 +    private static final int CARRIER_MESSAGE_FRAMES = 256;
 +    private static final long OUTBOUND_QUEUE_LIMIT = 32 * 1024 * 1024;
