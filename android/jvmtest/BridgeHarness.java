@@ -98,6 +98,21 @@ public class BridgeHarness {
         Thread.sleep(300);
         check(!transport.isRunning(), "transport stopped");
 
+        // A system WebView without the exact origin binary message boundary must fail closed:
+        // the listener still exists, so tgnet never falls back to a direct connection, but no
+        // logical stream is ever carried.
+        androidx.webkit.WebViewFeature.supported = false;
+        int closedPort = transport.start(publicHost, secret);
+        check(closedPort > 0, "unsupported webview still binds the listener");
+        check(transport.getState() == WebProxyTransport.STATE_UNSUPPORTED, "unsupported webview is reported");
+        try (Socket socket = new Socket("127.0.0.1", closedPort)) {
+            socket.setSoTimeout(5000);
+            socket.getOutputStream().write(new byte[]{1, 2, 3, 4});
+            socket.getOutputStream().flush();
+            check(socket.getInputStream().read() == -1, "unsupported webview carries no traffic");
+        }
+        transport.stop();
+
         System.out.println(failures == 0 ? "ALL PASSED" : (failures + " FAILURES"));
         System.exit(failures == 0 ? 0 : 1);
     }
